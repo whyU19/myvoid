@@ -4,6 +4,7 @@
 //!   clipboard [-t MIME] [text...]   copy the arguments, or stdin when none
 //!   clipboard history               pick an entry of the history with the menu tool
 //!                                   and put it back on the clipboard
+//!   clipboard paste [-t MIME]       print the clipboard (used by neovim)
 //!   clipboard watch                 record everything copied into the history
 //!                                   (~/.cache/clipboard, 50 slots); runs from `session`
 //! Copied data is served by a background copy of this program that exits as
@@ -31,6 +32,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
+
+const MAX_PASTE: u64 = 64 * 1024 * 1024;
 
 const TEXT_MIMES: [&str; 5] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"];
 
@@ -134,15 +137,54 @@ impl Clip {
 }
 
 
+struct PasteJob {
+    want: Option<String>,
+    result: Vec<u8>,
+    done: bool,
+}
+
 struct State {
     data: Arc<Vec<u8>>,
     done: bool,
     /// Some = watch mode: record selections into the history
     watch: Option<Arc<Mutex<Clip>>>,
+    /// Some = paste mode: read the current selection
+    paste: Option<PasteJob>,
     offers: HashMap<ObjectId, Vec<String>>,
 }
 
 impl State {
+    fn on_paste(&mut self, offer: Option<ZwlrDataControlOfferV1>, conn: &Connection) {
+        let Some(offer) = offer else {
+            if let Some(j) = &mut self.paste {
+                j.done = true;
+            }
+            return;
+        };
+        let mimes = self.offers.remove(&offer.id()).unwrap_or_default();
+        let want = self.paste.as_ref().and_then(|j| j.want.clone());
+        let mime = match want {
+            Some(w) => mimes.iter().find(|m| **m == w).cloned(),
+            None => TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == **t)).map(|t| t.to_string()),
+        };
+        if let Some(mime) = mime {
+            if let Ok((mut rd, wr)) = UnixStream::pair() {
+                offer.receive(mime, wr.as_fd());
+                let _ = conn.flush();
+                drop(wr);
+                let mut buf = Vec::new();
+                let _ = (&mut rd).take(MAX_PASTE).read_to_end(&mut buf);
+                if let Some(j) = &mut self.paste {
+                    j.result = buf;
+                }
+            }
+        }
+        offer.destroy();
+        if let Some(j) = &mut self.paste {
+            j.done = true;
+        }
+    }
+
     fn on_selection(&mut self, offer: ZwlrDataControlOfferV1, conn: &Connection) {
         let mimes = self.offers.remove(&offer.id()).unwrap_or_default();
         let secret = mimes.iter().any(|m| m == "x-kde-passwordManagerHint");
@@ -193,7 +235,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
         conn: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if state.watch.is_none() {
+        if state.watch.is_none() && state.paste.is_none() {
             return;
         }
         match event {
@@ -201,7 +243,9 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 state.offers.insert(id.id(), Vec::new());
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
-                if let Some(offer) = id {
+                if state.paste.is_some() {
+                    state.on_paste(id, conn);
+                } else if let Some(offer) = id {
                     state.on_selection(offer, conn);
                 }
             }
@@ -228,7 +272,7 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if state.watch.is_some() {
+        if state.watch.is_some() || state.paste.is_some() {
             if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
                 state.offers.entry(offer.id()).or_default().push(mime_type);
             }
@@ -299,11 +343,34 @@ fn serve(mime: Option<String>) -> ! {
         }
     }
     device.set_selection(Some(&source));
-    let mut state = State { data: Arc::new(data), done: false, watch: None, offers: HashMap::new() };
+    let mut state = State { data: Arc::new(data), done: false, watch: None, paste: None, offers: HashMap::new() };
     while !state.done {
         if queue.blocking_dispatch(&mut state).is_err() {
             break;
         }
+    }
+    std::process::exit(0);
+}
+
+/// Print the current clipboard to stdout.
+fn paste(want: Option<String>) -> ! {
+    let (mut queue, manager, seat) = bind_all();
+    let qh = queue.handle();
+    let _device = manager.get_data_device(&seat, &qh, ());
+    let mut state = State {
+        data: Arc::new(Vec::new()),
+        done: false,
+        watch: None,
+        paste: Some(PasteJob { want, result: Vec::new(), done: false }),
+        offers: HashMap::new(),
+    };
+    while !state.paste.as_ref().map(|j| j.done).unwrap_or(true) {
+        if queue.blocking_dispatch(&mut state).is_err() {
+            break;
+        }
+    }
+    if let Some(j) = state.paste {
+        let _ = std::io::stdout().write_all(&j.result);
     }
     std::process::exit(0);
 }
@@ -317,6 +384,7 @@ fn watch() -> ! {
         data: Arc::new(Vec::new()),
         done: false,
         watch: Some(Arc::new(Mutex::new(Clip::new()))),
+        paste: None,
         offers: HashMap::new(),
     };
     loop {
@@ -354,8 +422,12 @@ fn main() {
                 return;
             }
             "watch" => watch(),
+            "paste" => paste(None),
             _ => {}
         }
+    }
+    if words.len() == 1 && words[0] == "paste" {
+        paste(mime.clone());
     }
 
     let mut data = Vec::new();
