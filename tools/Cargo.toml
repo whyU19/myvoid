@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["wlkit", "menu", "setbg", "view", "play", "display", "status", "fm", "lock", "capture", "clipboard"]
+
+[profile.release]
+opt-level = 3
+strip = true

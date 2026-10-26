@@ -1,0 +1,32 @@
+#!/bin/sh
+
+dur=4
+icon=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u|--urgency) [ "$2" = critical ] && dur=8; shift 2 ;;
+        --urgency=critical) dur=8; shift ;;
+        -i|--icon) icon="$2"; shift 2 ;;
+        --icon=*) icon="${1#--icon=}"; shift ;;
+        -a|-t|-c|-h|-r|-A) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+
+[ $# -eq 0 ] && exit 0
+msg="$1"
+[ -n "$2" ] && msg="$msg: $2"
+msg=$(printf '%s' "$msg" | tr '\n' ' ')
+
+case "$icon" in
+    file://*) icon="${icon#file://}" ;;
+esac
+case "$icon" in
+    /*) [ -f "$icon" ] || icon= ;;
+    *) icon= ;;
+esac
+
+printf '%s\n%s\n%s\n' "$(( $(date +%s) + dur ))" "$msg" "$icon" > "/tmp/bar-msg-$(id -u)"
+exit 0

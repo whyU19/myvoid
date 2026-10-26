@@ -1,0 +1,187 @@
+#!/bin/bash
+_bluetooth_strip() {
+  sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g;s/\r//g;s/^[[:space:]]+//'
+}
+
+_bluetooth_is_connected() {
+  bluetoothctl info "$1" 2>/dev/null | grep -q "Connected: yes"
+}
+
+_bluetooth_add_device() {
+  local mac=$1 name=$2
+  [[ ${seen[$mac]+x} ]] && return
+  seen[$mac]=1
+  if _bluetooth_is_connected "$mac"; then
+    buf+="$mac $name *"$'\n'
+  else
+    buf+="$mac $name"$'\n'
+  fi
+}
+
+_bluetooth_parse_scan() {
+  local clean=$1 _mac _name
+  if [[ "$clean" =~ \[NEW\][[:space:]]Device[[:space:]]+([0-9A-Fa-f:]{17})[[:space:]]+(.*)$ ]]; then
+    _mac="${BASH_REMATCH[1]}"
+    _name="${BASH_REMATCH[2]}"
+  elif [[ "$clean" =~ \[NEW\][[:space:]]Device[[:space:]]+([0-9A-Fa-f:]{17})$ ]]; then
+    _mac="${BASH_REMATCH[1]}"
+    _name=$(bluetoothctl info "$_mac" 2>/dev/null | awk -F': ' '/^[[:space:]]+Name:/{print $2; exit}')
+    _name=${_name:-Unknown}
+  else
+    return 1
+  fi
+  _bluetooth_add_device "$_mac" "$_name"
+}
+
+collect_devices() {
+  declare -A seen
+  local line clean buf=""
+
+  bluetoothctl power on >/dev/null 2>&1
+  bluetoothctl scan off >/dev/null 2>&1
+
+  while read -r mac name; do
+    [ -z "$mac" ] && continue
+    _bluetooth_add_device "$mac" "$name"
+  done < <(bluetoothctl devices Paired 2>/dev/null | sed -E 's/^Device //')
+
+  while IFS= read -r line; do
+    clean=$(_bluetooth_strip <<<"$line")
+    _bluetooth_parse_scan "$clean" || true
+  done < <(bluetoothctl --timeout 8 scan on 2>&1)
+
+  bluetoothctl scan off >/dev/null 2>&1
+  printf '%s' "$buf"
+}
+
+_bluetooth_mac_to_card() {
+  echo "bluez_card.${1//:/_}"
+}
+
+_bluetooth_setup_audio() {
+  local mac=$1 card sink profile i=0 timeout=15
+
+  card=$(_bluetooth_mac_to_card "$mac")
+
+  while [ "$i" -lt "$timeout" ]; do
+    pactl list cards short 2>/dev/null | grep -qF "$card" && break
+    sleep 1
+    i=$((i + 1))
+  done
+
+  if ! pactl list cards short 2>/dev/null | grep -qF "$card"; then
+    notify-send -u critical 'Bluetooth' 'Audio not ready'
+    return 1
+  fi
+
+  for profile in a2dp-sink a2dp-sink-sbc a2dp-sink-sbc_xq; do
+    pactl set-card-profile "$card" "$profile" 2>/dev/null && break
+  done
+
+  i=0
+  while [ "$i" -lt "$timeout" ]; do
+    sink=$(pactl list sinks short 2>/dev/null |
+      awk -v m="${mac//:/_}" '$2 ~ "bluez_output." m {print $2; exit}')
+    [ -n "$sink" ] && break
+    sleep 1
+    i=$((i + 1))
+  done
+
+  if [ -z "$sink" ]; then
+    notify-send -u critical 'Bluetooth' 'No audio output'
+    return 1
+  fi
+
+  pactl set-default-sink "$sink"
+  local desc
+  desc=$(pactl list sinks 2>/dev/null | awk -v s="$sink" '
+    $0 ~ "Name: " s { found=1 }
+    found && /^[[:space:]]+Description:/ { print $2; exit }
+  ')
+  notify-send 'Bluetooth' "Audio: ${desc:-$sink}"
+}
+
+pair_connect() {
+  local mac=$1 name=$2 i=0 timeout=45
+
+  bluetoothctl power on >/dev/null 2>&1
+  bluetoothctl pairable on >/dev/null 2>&1
+
+  if bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes"; then
+    notify-send 'Bluetooth' "Connected $name"
+    _bluetooth_setup_audio "$mac"
+    return 0
+  fi
+
+  if ! bluetoothctl info "$mac" 2>/dev/null | grep -q "Paired: yes"; then
+    notify-send 'Bluetooth' "Pairing $name"
+
+    (
+      echo "default-agent"
+      echo "scan on"
+      sleep 5
+      echo "pair $mac"
+      sleep "$timeout"
+      echo "scan off"
+    ) | bluetoothctl --agent NoInputNoOutput
+
+    while [ "$i" -lt "$timeout" ]; do
+      bluetoothctl info "$mac" 2>/dev/null | grep -q "Paired: yes" && break
+      sleep 1
+      i=$((i + 1))
+    done
+
+    if ! bluetoothctl info "$mac" 2>/dev/null | grep -q "Paired: yes"; then
+      bluetoothctl scan off >/dev/null 2>&1
+      notify-send -u critical 'Bluetooth' "Pair failed: $name"
+      return 1
+    fi
+  fi
+
+  bluetoothctl trust "$mac" >/dev/null 2>&1
+
+  if ! bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes"; then
+    i=0
+    while [ "$i" -lt 3 ]; do
+      bluetoothctl connect "$mac" 2>/dev/null && break
+      sleep 2
+      i=$((i + 1))
+    done
+  fi
+
+  bluetoothctl scan off >/dev/null 2>&1
+
+  if ! bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes"; then
+    notify-send -u critical 'Bluetooth' "Connect failed: $name"
+    return 1
+  fi
+
+  notify-send 'Bluetooth' "Connected $name"
+  _bluetooth_setup_audio "$mac"
+}
+
+notify-send 'Bluetooth' 'Scanning'
+devices=$(collect_devices)
+if [ -z "$devices" ]; then
+  notify-send -u critical 'Bluetooth' 'No devices'
+  exit 0
+fi
+
+choice=$(printf '%s' "$devices" | "$HOME/.config/menu/menu" "$@" -l 15 -p "Bluetooth>")
+[ -z "$choice" ] && exit 0
+
+mac=$(awk '{print $1}' <<<"$choice")
+name=$(sed -E 's/^[^ ]+ //' <<<"$choice")
+name="${name% \*}"
+
+if _bluetooth_is_connected "$mac"; then
+  bluetoothctl disconnect "$mac" >/dev/null 2>&1
+  sleep 1
+  if _bluetooth_is_connected "$mac"; then
+    notify-send -u critical 'Bluetooth' "Disconnect failed: $name"
+  else
+    notify-send 'Bluetooth' "Disconnected $name"
+  fi
+else
+  pair_connect "$mac" "$name"
+fi

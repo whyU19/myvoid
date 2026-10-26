@@ -1,0 +1,9 @@
+[package]
+name = "view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wlkit = { path = "../wlkit" }
+smithay-client-toolkit = "0.19"
+image = { version = "0.25", default-features = false }

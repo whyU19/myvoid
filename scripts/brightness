@@ -1,0 +1,49 @@
+#!/bin/sh
+export PATH="$HOME/.local/bin:$PATH"
+
+dev=$(ls -d /sys/class/backlight/* 2>/dev/null | head -n 1)
+if [ -z "$dev" ]; then
+    notify-send -u critical 'Brightness' 'No backlight'
+    exit 1
+fi
+
+slider() {
+    fill=$(($1 * 20 / 100))
+    bar=""
+    i=0
+    while [ "$i" -lt 20 ]; do
+        if [ "$i" -lt "$fill" ]; then
+            bar="$bar█"
+        else
+            bar="$bar░"
+        fi
+        i=$((i + 1))
+    done
+    printf '%s' "$bar"
+}
+
+max=$(cat "$dev/max_brightness")
+cur=$(cat "$dev/brightness")
+step=$((max / 20))
+[ "$step" -lt 1 ] && step=1
+min=$((max / 50))
+[ "$min" -lt 1 ] && min=1
+
+case "$1" in
+    up) new=$((cur + step)) ;;
+    down) new=$((cur - step)) ;;
+    *)
+        echo "usage: brightness up|down" >&2
+        exit 1
+        ;;
+esac
+[ "$new" -gt "$max" ] && new=$max
+[ "$new" -lt "$min" ] && new=$min
+
+if ! { echo "$new" > "$dev/brightness"; } 2>/dev/null; then
+    notify-send -u critical 'Brightness' 'No permission'
+    exit 1
+fi
+
+pct=$((new * 100 / max))
+notify-send 'Brightness' "$(slider "$pct") $pct%"

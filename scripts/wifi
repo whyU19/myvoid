@@ -1,0 +1,113 @@
+#!/bin/bash
+dev=$(iwctl device list 2>/dev/null |
+  sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' |
+  grep -Ev '^[[:space:]]*$' |
+  grep -Ev '^-+$' |
+  grep -Ev '^[[:space:]]*Devices[[:space:]]*$' |
+  grep -Ev '^[[:space:]]*Name[[:space:]]+Address' |
+  awk '{print $1; exit}')
+
+if [ -z "$dev" ]; then
+  notify-send -u critical 'WiFi' 'No adapter'
+  exit 1
+fi
+
+iwctl station "$dev" scan >/dev/null 2>&1 &
+
+cur_ssid=$(iwctl station "$dev" show 2>/dev/null |
+  awk '/Connected network/{for(i=3;i<=NF;i++) printf "%s ",$i; print ""}' | xargs 2>/dev/null)
+
+known=$(iwctl known-networks list 2>/dev/null |
+  sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' |
+  awk '
+      /^[[:space:]]*$/ { next }
+      /^[[:space:]]*-+[[:space:]]*$/ { next }
+      /^[[:space:]]*Known Networks[[:space:]]*$/ { next }
+      tolower($0) ~ /^[[:space:]]*no .*networks/ { next }
+      /^[[:space:]]*Name[[:space:]]+Security/ { next }
+      {
+        name = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i == "psk" || $i == "open") break
+          name = (name != "" ? name " " : "") $i
+        }
+        if (name != "")
+          print name
+      }')
+
+raw=$(iwctl station "$dev" get-networks 2>/dev/null |
+  sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' |
+  awk -v cur="$cur_ssid" '
+      /^[[:space:]]*$/ { next }
+      /^[[:space:]]*-+[[:space:]]*$/ { next }
+      /^[[:space:]]*Available networks[[:space:]]*$/ { next }
+      tolower($0) ~ /^[[:space:]]*no .*networks/ { next }
+      /^[[:space:]]*Network name[[:space:]]+Security[[:space:]]+Signal[[:space:]]*$/ { next }
+      {
+        sub(/^[[:space:]]*>?[[:space:]]*/, "", $0)
+        n = split($0, parts, /[[:space:]][[:space:]]+/)
+        if (n >= 1 && parts[1] != "") {
+          security = ""
+          for (i = 2; i <= n; i++)
+            if (parts[i] == "psk" || parts[i] == "open") { security = parts[i]; break }
+          printf "%s\t%s\t%s\n", parts[1], security, (parts[1] == cur ? "*" : "")
+        }
+      }')
+
+networks=$(printf '%b\n' "$raw" | awk -F'\t' '{printf "%s%s\n", $1, ($3=="*" ? " *" : "")}')
+
+if [ -z "$networks" ]; then
+  notify-send -u critical 'WiFi' 'No networks'
+  exit 0
+fi
+
+network=$(printf '%s\n' "$networks" | "$HOME/.config/menu/menu" "$@" -l 15 -p "Wi-Fi>")
+[ -z "$network" ] && exit 0
+
+network="${network% \*}"
+if [ -n "$cur_ssid" ] && [ "$network" = "$cur_ssid" ]; then
+  iwctl station "$dev" disconnect >/dev/null 2>&1
+  notify-send 'WiFi' "Disconnected $network"
+  exit 0
+fi
+
+_wifi_connect() {
+  if [ -n "$1" ]; then
+    timeout 15 iwctl --passphrase="$1" station "$dev" connect "$network" </dev/null >/dev/null 2>&1
+  else
+    timeout 15 iwctl --dont-ask station "$dev" connect "$network" </dev/null >/dev/null 2>&1
+  fi
+
+  local i=0 connected=0
+  while [ "$i" -lt 10 ]; do
+    if iwctl station "$dev" show 2>/dev/null | grep -q "Connected network.*$network"; then
+      connected=1
+      break
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+
+  if [ "$connected" -eq 1 ]; then
+    notify-send 'WiFi' "Connected $network"
+  else
+    notify-send -u critical 'WiFi' "Connect failed: $network"
+  fi
+}
+
+if printf '%s\n' "$known" | grep -qxF "$network"; then
+  _wifi_connect
+  exit 0
+fi
+
+security=$(printf '%b\n' "$raw" | awk -F'\t' -v n="$network" '$1 == n {print $2; exit}')
+
+if [ "$security" = "open" ]; then
+  _wifi_connect
+  exit 0
+fi
+
+pass=$(printf '' | "$HOME/.config/menu/menu" "$@" -P -p "Password $network>")
+[ -z "$pass" ] && exit 0
+
+_wifi_connect "$pass"

@@ -1,0 +1,743 @@
+#!/bin/bash
+set -e
+
+[ "$(id -u)" -eq 0 ] || exit 1
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export XBPS_ARCH=x86_64
+
+chattr -i /etc/resolv.conf 2>/dev/null || true
+
+# Detect boot mode
+if [ -d /sys/firmware/efi/efivars ]; then
+  BOOT_MODE="uefi"
+else
+  BOOT_MODE="bios"
+fi
+
+detect_hw() {
+  # GPU detection
+  GPU_INFO=$(lspci -nnk | grep -Ei "VGA compatible controller|3D controller|Display controller" || true)
+  HAS_NVIDIA=0
+  HAS_INTEL=0
+  HAS_AMD=0
+  echo "$GPU_INFO" | grep -qi nvidia && HAS_NVIDIA=1
+  echo "$GPU_INFO" | grep -qi intel && HAS_INTEL=1
+  echo "$GPU_INFO" | grep -Eqi "amd|ati|radeon" && HAS_AMD=1
+
+  # Battery detection
+  IS_LAPTOP=0
+  case "$(cat /sys/class/dmi/id/chassis_type 2>/dev/null)" in
+    8 | 9 | 10 | 14 | 31 | 32) IS_LAPTOP=1 ;;
+  esac
+  ls /sys/class/power_supply/BAT* >/dev/null 2>&1 && IS_LAPTOP=1
+
+  CPU_VENDOR=$(grep -m1 vendor_id /proc/cpuinfo | awk '{print $3}')
+}
+
+build_pkgs() {
+  # dwl (Wayland compositor) is built from source. DWL_REF empty = default branch;
+  # set it to a tag (e.g. v0.8) to pin. dwl needs a specific wlroots release, so
+  # read it from dwl's config.mk and install the matching wlroots*-devel package.
+  DWL_REPO="https://codeberg.org/dwl/dwl"
+  DWL_REF=""
+  if [ -n "$DWL_REF" ]; then DWL_RAW="$DWL_REPO/raw/tag/$DWL_REF/config.mk"; else DWL_RAW="$DWL_REPO/raw/branch/main/config.mk"; fi
+  WLR_VER=""
+  if xbps-fetch -o /tmp/dwl-config.mk "$DWL_RAW" >/dev/null 2>&1; then
+    WLR_VER=$(grep -o 'wlroots-[0-9][0-9.]*' /tmp/dwl-config.mk | head -1 | cut -d- -f2)
+  fi
+  WLR_VER=${WLR_VER:-0.19}
+
+  CORE_PKGS="dbus iwd seatd make gcc pkg-config rust cargo wayland-devel wayland-protocols wlroots${WLR_VER}-devel libxkbcommon-devel libinput-devel pam-devel"
+  if [ "$MODE" = full ]; then
+    CORE_PKGS="base-system linux-firmware grub $CORE_PKGS"
+    [ "$BOOT_MODE" = "uefi" ] && CORE_PKGS="$CORE_PKGS grub-x86_64-efi efibootmgr"
+    [ "$ENCRYPT" -eq 1 ] && CORE_PKGS="$CORE_PKGS lvm2 cryptsetup"
+  fi
+
+  EXTRA_PKGS="git curl pipewire wireplumber libspa-bluetooth alsa-utils bluez mesa-dri pulseaudio-utils foot
+  font-firacode dejavu-fonts-ttf neovim ffmpeg
+  eza bat fd ripgrep dust duf procs"
+
+  [ "$IS_LAPTOP" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS tlp"
+
+  # CPU microcode
+  if [ "$CPU_VENDOR" = "GenuineIntel" ]; then
+    EXTRA_PKGS="$EXTRA_PKGS intel-ucode"
+  elif [ "$CPU_VENDOR" = "AuthenticAMD" ]; then
+    EXTRA_PKGS="$EXTRA_PKGS linux-firmware-amd"
+  fi
+
+  # GPU-specific packages
+  if [ "$HAS_INTEL" -eq 1 ]; then
+    EXTRA_PKGS="$EXTRA_PKGS mesa-vulkan-intel libva-intel-driver intel-media-driver intel-video-accel"
+  fi
+
+  if [ "$HAS_AMD" -eq 1 ]; then
+    EXTRA_PKGS="$EXTRA_PKGS mesa-vulkan-radeon mesa-vaapi linux-firmware-amd"
+  fi
+
+  if [ "$HAS_NVIDIA" -eq 1 ]; then
+    EXTRA_PKGS="$EXTRA_PKGS linux-headers nvidia nvidia-libs-32bit nvidia-opencl"
+  fi
+
+  # Vulkan loader + 32-bit driver (Wine/Proton games, incl. 32-bit ones, need both)
+  if [ "$INSTALL_VULKAN" -eq 1 ]; then
+    EXTRA_PKGS="$EXTRA_PKGS vulkan-loader vulkan-loader-32bit Vulkan-Tools mesa-dri-32bit"
+    [ "$HAS_AMD" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS mesa-vulkan-radeon-32bit"
+    [ "$HAS_INTEL" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS mesa-vulkan-intel-32bit"
+    # NVIDIA 32-bit Vulkan ICD comes from nvidia-libs-32bit (already added above)
+  fi
+  return 0
+}
+
+write_env() {
+  {
+    printf 'USERNAME=%q\n' "$USERNAME"
+    printf 'HOSTNAME=%q\n' "$HOSTNAME"
+    printf 'TIMEZONE=%q\n' "$TIMEZONE"
+    printf 'LOCALE=%q\n' "$LOCALE"
+    printf 'KBLAYOUT=%q\n' "$KBLAYOUT"
+    printf 'ROOT_HASH=%q\n' "$ROOT_HASH"
+    printf 'USER_HASH=%q\n' "$USER_HASH"
+    printf 'DISK=%q\n' "$DISK"
+    printf 'ENCRYPT=%q\n' "$ENCRYPT"
+    printf 'CRYPT_PART=%q\n' "${CRYPT_PART:-}"
+    printf 'VG_NAME=%q\n' "$VG_NAME"
+    printf 'BOOT_MODE=%q\n' "$BOOT_MODE"
+    printf 'HAS_NVIDIA=%q\n' "$HAS_NVIDIA"
+    printf 'HAS_INTEL=%q\n' "$HAS_INTEL"
+    printf 'HAS_AMD=%q\n' "$HAS_AMD"
+    printf 'DWL_REPO=%q\n' "$DWL_REPO"
+    printf 'DWL_REF=%q\n' "$DWL_REF"
+    printf 'MODE=%q\n' "$MODE"
+  } >"$1"
+}
+
+write_chroot_script() {
+cat >"$1" <<'CHROOT_EOF'
+#!/bin/bash
+set -e
+. /root/install.env
+
+enable_svc() {
+  if [ -d "/etc/sv/$1" ]; then
+    ln -sf "/etc/sv/$1" /etc/runit/runsvdir/default/
+  fi
+}
+
+if [ "$MODE" = full ]; then
+usermod -p "$ROOT_HASH" root
+
+# Full disk encryption
+if [ "$ENCRYPT" -eq 1 ]; then
+  echo
+  echo "=== Full disk encryption: keyfile setup ==="
+  chown root:root /
+  chmod 755 /
+
+  CRYPT_UUID=$(blkid -o value -s UUID "$CRYPT_PART")
+
+  grep -q '^GRUB_ENABLE_CRYPTODISK=' /etc/default/grub \
+    && sed -i 's/^GRUB_ENABLE_CRYPTODISK=.*/GRUB_ENABLE_CRYPTODISK=y/' /etc/default/grub \
+    || echo 'GRUB_ENABLE_CRYPTODISK=y' >>/etc/default/grub
+  sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\1 rd.lvm.vg=${VG_NAME} rd.luks.uuid=${CRYPT_UUID}\"|" /etc/default/grub
+
+  # Keyfile
+  dd bs=1 count=64 if=/dev/urandom of=/boot/volume.key
+  until cryptsetup luksAddKey "$CRYPT_PART" /boot/volume.key; do
+    echo "!! Try again."
+  done
+  chmod 000 /boot/volume.key
+  chmod -R g-rwx,o-rwx /boot
+
+  echo "${VG_NAME}   UUID=${CRYPT_UUID}   /boot/volume.key   luks" >/etc/crypttab
+  mkdir -p /etc/dracut.conf.d
+  echo 'install_items+=" /boot/volume.key /etc/crypttab "' >/etc/dracut.conf.d/10-crypt.conf
+fi
+
+# Timezone
+ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+hwclock --systohc 2>/dev/null || true
+
+# Locale
+if [ -f /etc/default/libc-locales ]; then
+  sed -i "s/^#\s*${LOCALE} UTF-8/${LOCALE} UTF-8/" /etc/default/libc-locales
+  xbps-reconfigure -f glibc-locales
+fi
+echo "LANG=${LOCALE}" >/etc/locale.conf
+
+if [ -f /etc/rc.conf ]; then
+  sed -i "s|^#\?KEYMAP=.*|KEYMAP=\"${KBLAYOUT}\"|" /etc/rc.conf
+  sed -i "s|^#\?TIMEZONE=.*|TIMEZONE=\"${TIMEZONE}\"|" /etc/rc.conf
+fi
+
+echo "${HOSTNAME}" >/etc/hostname
+cat >>/etc/hosts <<HOSTS
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+HOSTS
+
+GROUPS_OK="wheel"
+for g in audio video input lp storage network kvm optical bluetooth _seatd; do
+  getent group "$g" >/dev/null && GROUPS_OK="$GROUPS_OK,$g"
+done
+useradd -m -G "$GROUPS_OK" -s /bin/bash "${USERNAME}"
+usermod -p "$USER_HASH" "${USERNAME}"
+for u in root "${USERNAME}"; do
+  passwd -S "$u" | grep -q " P " || { echo "!! password for $u not set" >&2; exit 1; }
+done
+
+mkdir -p /etc/sudoers.d
+cat >/etc/sudoers.d/10-wheel <<'SUDOERS'
+%wheel ALL=(ALL:ALL) ALL
+Defaults env_keep += "HOME"
+SUDOERS
+chmod 0440 /etc/sudoers.d/10-wheel
+visudo -cf /etc/sudoers.d/10-wheel || exit 1
+else
+  # existing system: just give the user the groups the desktop needs
+  for g in audio video input lp storage network kvm optical bluetooth _seatd; do
+    getent group "$g" >/dev/null && usermod -aG "$g" "${USERNAME}" || true
+  done
+fi
+
+# iwd config
+mkdir -p /etc/iwd
+cat >/etc/iwd/main.conf <<'IWDCONF'
+[General]
+EnableNetworkConfiguration=true
+IWDCONF
+
+# XDG runtime dir
+# Void has no pam_systemd/elogind, so nothing creates /run/user/$UID and
+# PipeWire would refuse to start ("no runtime dir found"). Make it at
+# boot instead; $USERNAME's UID is written into the conf below.
+install -d -m 755 /etc/sv/user-runtime-dir
+cat >/etc/sv/user-runtime-dir/run <<'RUNTIME_EOF'
+#!/bin/sh
+# Create the XDG runtime dir that pam_systemd/elogind would normally
+# provide at login. It lives on tmpfs, so it has to be made per boot.
+. /etc/sv/user-runtime-dir/conf 2>/dev/null || true
+uid=${RUNTIME_UID:-1000}
+
+mkdir -p "/run/user/$uid"
+chown "$uid:$uid" "/run/user/$uid"
+chmod 700 "/run/user/$uid"
+
+exec pause
+RUNTIME_EOF
+chmod 755 /etc/sv/user-runtime-dir/run
+printf 'RUNTIME_UID=%s\n' "$(id -u "$USERNAME")" >/etc/sv/user-runtime-dir/conf
+
+# Enable services
+mkdir -p /etc/runit/runsvdir/default
+for svc in dbus seatd iwd bluetoothd user-runtime-dir; do
+  enable_svc "$svc"
+done
+
+if [ "$MODE" = full ]; then
+# Limits
+cat >>/etc/security/limits.conf <<LIMITSCONF
+${USERNAME}    soft    nofile  524288
+${USERNAME}    hard    nofile  524288
+LIMITSCONF
+
+for pamfile in system-login su sudo; do
+  if [ -f "/etc/pam.d/$pamfile" ] && ! grep -q 'pam_limits.so' "/etc/pam.d/$pamfile"; then
+    echo "session    required   pam_limits.so" >>"/etc/pam.d/$pamfile"
+  fi
+done
+
+mkdir -p /etc/sysctl.d
+echo 'fs.file-max = 2097152' >/etc/sysctl.d/99-filemax.conf
+fi
+
+# User directories
+H="/home/${USERNAME}"
+mkdir -p "$H/Downloads" "$H/Music" "$H/Pictures/Backgrounds" "$H/Pictures/Screenshots" "$H/Videos/Recordings" "$H/.config" "$H/.local/bin" "$H/.local/state/bash"
+
+cat >/etc/fonts/local.conf <<'FONTCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <alias binding="same">
+    <family>FiraCode Nerd Font</family>
+    <prefer>
+      <family>Fira Code</family>
+    </prefer>
+  </alias>
+</fontconfig>
+FONTCONF
+fc-cache -f
+
+# dwl (Wayland compositor): clone, use our config.def.h, build
+set -o pipefail
+DOT=/root/dotfiles
+rm -rf "$H/.config/dwl"
+git clone --depth 1 ${DWL_REF:+--branch "$DWL_REF"} "$DWL_REPO" "$H/.config/dwl"
+rm -rf "$H/.config/dwl/.git"
+if [ -f "$DOT/dwl/config.def.h" ]; then
+  cp "$DOT/dwl/config.def.h" "$H/.config/dwl/config.def.h"
+fi
+rm -f "$H/.config/dwl/config.h"
+(cd "$H/.config/dwl" && make clean && make install && make clean) 2>&1 | tee /root/dwl-build.log
+
+# Install dotfiles
+DOT=/root/dotfiles
+
+src_of() {
+  if [ -f "$DOT/$1" ]; then echo "$DOT/$1"
+  elif [ -f "$DOT/$1/$1" ]; then echo "$DOT/$1/$1"
+  fi
+}
+
+shopt -s dotglob
+for item in "$DOT"/*; do
+  [ -e "$item" ] || continue
+  name=$(basename "$item")
+  case "$name" in
+    dwl | tools | setup | README* | LICENSE* | *.md) continue ;;
+    scripts)
+      cp -r "$item"/. "$H/.local/bin/"
+      chmod +x "$H/.local/bin"/* 2>/dev/null || true
+      ;;
+    .bashrc)
+      f=$(src_of .bashrc)
+      [ -n "$f" ] || continue
+      cp "$f" "$H/.bashrc"
+      ;;
+    .git*) continue ;;
+    *)
+      rm -rf "$H/.config/$name"
+      cp -r "$item" "$H/.config/$name"
+      ;;
+  esac
+done
+
+# Rust tools (menu setbg view play display status fm lock capture clipboard): sources live in
+# ~/.config/tools (cargo workspace), binaries in ~/.config/<name>/<name>.
+rm -rf "$H/.config/tools"
+cp -r "$DOT/tools" "$H/.config/tools"
+CARGO_HOME=/root/.cargo-build CARGO_TARGET_DIR=/root/tools-target \
+  cargo build --release --manifest-path "$H/.config/tools/Cargo.toml" 2>&1 | tee /root/tools-build.log
+for name in menu setbg view play display status fm lock capture clipboard; do
+  mkdir -p "$H/.config/$name"
+  install -m 755 "/root/tools-target/release/$name" "$H/.config/$name/$name"
+done
+rm -rf /root/tools-target /root/.cargo-build
+
+# udev rules
+mkdir -p /etc/udev/rules.d
+cat >/etc/udev/rules.d/90-hardware.rules <<'UDEVRULE'
+ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
+ACTION=="add", SUBSYSTEM=="rfkill", RUN+="/usr/bin/rfkill unblock all"
+ACTION=="add", SUBSYSTEM=="backlight", ATTR{brightness}="1"
+UDEVRULE
+
+# PAM service for the screen locker (lock)
+printf 'auth include login\n' >/etc/pam.d/lock
+
+# Wayland session environment (keyboard layout is read by dwl/xkbcommon from here)
+cat >/etc/profile.d/wayland-env.sh <<WLENV
+export XKB_DEFAULT_LAYOUT=${KBLAYOUT}
+export LIBSEAT_BACKEND=seatd
+WLENV
+
+# .bash_profile
+cat >"$H/.bash_profile" <<'BASHPROFILE'
+[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
+
+if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  exec dbus-run-session -- dwl -s "$HOME/.local/bin/session" >/dev/null 2>"$HOME/.local/state/dwl.log"
+fi
+BASHPROFILE
+
+# Root configs symlink
+mkdir -p /root/.config
+for d in "$H"/.config/*/; do
+  [ -d "$d" ] || continue
+  dname=$(basename "$d")
+  rm -rf "/root/.config/$dname"
+  ln -sf "$H/.config/$dname" "/root/.config/$dname"
+done
+
+# NVIDIA: Wayland compositors need DRM kernel modesetting
+if [ "$HAS_NVIDIA" -eq 1 ]; then
+  echo 'options nvidia_drm modeset=1 fbdev=1' >/etc/modprobe.d/nvidia-drm.conf
+fi
+
+# NVIDIA driver setup
+if [ "$HAS_NVIDIA" -eq 1 ] && { [ "$HAS_INTEL" -eq 1 ] || [ "$HAS_AMD" -eq 1 ]; }; then
+
+  cat >/etc/modprobe.d/nvidia.conf <<'NVMEOF'
+options nvidia NVreg_DynamicPowerManagement=0x02 NVreg_EnableGpuFirmware=0
+NVMEOF
+
+  mkdir -p /etc/dracut.conf.d
+  cat >/etc/dracut.conf.d/10-nvidia.conf <<'DRACUTEOF'
+add_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "
+DRACUTEOF
+fi
+
+if [ "$MODE" = full ]; then
+# GRUB
+grep -q '^GRUB_TIMEOUT=' /etc/default/grub \
+  && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub \
+  || echo 'GRUB_TIMEOUT=0' >>/etc/default/grub
+grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub \
+  && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub \
+  || echo 'GRUB_TIMEOUT_STYLE=hidden' >>/etc/default/grub
+
+if [ "$BOOT_MODE" = "uefi" ]; then
+  mount -t efivarfs none /sys/firmware/efi/efivars 2>/dev/null || true
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Void \
+    || grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
+else
+  grub-install "${DISK}"
+fi
+
+# Configure all packages
+xbps-reconfigure -fa
+
+for n in 3 4 5 6; do
+  rm -f "/etc/runit/runsvdir/default/agetty-tty$n"
+done
+
+grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
+chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
+
+# Cleanup
+rm -f /root/*-build.log
+xbps-remove -Oo -y 2>/dev/null || true
+
+[ "$MODE" = full ] && printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf || true
+CHROOT_EOF
+}
+
+echo
+echo "1) Full install  - wipe the whole disk and install Void from scratch"
+echo "2) Scripts only  - keep this system; install the packages, dotfiles, tools and dwl"
+read -rp "Mode [1]: " MODE_CHOICE
+MODE=full
+case "$MODE_CHOICE" in 2 | s | S | scripts) MODE=scripts ;; esac
+
+if [ "$MODE" = scripts ]; then
+  read -rp "Install for existing user: " USERNAME
+  id "$USERNAME" >/dev/null 2>&1 || { echo "No such user: $USERNAME"; exit 1; }
+  read -rp "Keyboard layout [us]: " KBLAYOUT
+  KBLAYOUT=${KBLAYOUT:-us}
+  read -rp "Install Vulkan? [Y/n]: " VULKAN_CHOICE
+  INSTALL_VULKAN=1
+  case "$VULKAN_CHOICE" in n | N | no | NO) INSTALL_VULKAN=0 ;; esac
+  ENCRYPT=0
+  detect_hw
+  build_pkgs
+  xbps-install -Sy $CORE_PKGS $EXTRA_PKGS || exit 1
+  rm -rf /root/dotfiles
+  mkdir -p /root/dotfiles
+  tar -C "$SCRIPT_DIR" --exclude=.git -cf - . | tar -C /root/dotfiles -xf -
+  write_env /root/install.env
+  chmod 600 /root/install.env
+  write_chroot_script /root/chroot-setup.sh
+  chmod +x /root/chroot-setup.sh
+  bash /root/chroot-setup.sh
+  rm -rf /root/chroot-setup.sh /root/install.env /root/dotfiles
+  echo
+  echo "Done. Log in on tty1 as $USERNAME (or reboot)."
+  exit 0
+fi
+
+lsblk -d -o NAME,SIZE,MODEL
+
+read -rp "Target disk (e.g. /dev/sda or /dev/nvme0n1): " DISK
+[ -b "$DISK" ] || exit 1
+
+read -rp "Hostname [void]: " HOSTNAME
+HOSTNAME=${HOSTNAME:-void}
+
+read -rp "New username [user]: " USERNAME
+USERNAME=${USERNAME:-user}
+
+get_hash() {
+  local a b
+  until [ -n "$a" ] && [ "$a" = "$b" ]; do
+    read -rsp "Password for $1: " a; echo >&2
+    read -rsp "Retype password: " b; echo >&2
+    [ "$a" = "$b" ] || echo "Passwords don't match, try again." >&2
+  done
+  printf '%s' "$a" | openssl passwd -6 -stdin
+}
+ROOT_HASH=$(get_hash root)
+USER_HASH=$(get_hash "$USERNAME")
+
+read -rp "Timezone [UTC]: " TIMEZONE
+TIMEZONE=${TIMEZONE:-UTC}
+LOCALE="en_US.UTF-8"
+[ -e "/usr/share/zoneinfo/${TIMEZONE}" ] || exit 1
+
+read -rp "Keyboard layout [us]: " KBLAYOUT
+KBLAYOUT=${KBLAYOUT:-us}
+loadkeys "$KBLAYOUT" 2>/dev/null || true
+
+read -rp "Mirror: [1] default  [2] fastest [1]: " MIRROR_CHOICE
+read -rp "EFI partition size in MiB [1024]: " EFI_SIZE
+EFI_SIZE=${EFI_SIZE:-1024}
+
+echo
+echo "Swap = disk space the system uses as overflow when RAM is full (also needed for hibernate)."
+read -rp "Swap size (e.g. 2G, 0 = no swap) [2G]: " SWAP_SIZE
+SWAP_SIZE=${SWAP_SIZE:-2G}
+[[ "$SWAP_SIZE" =~ ^([0-9]+[MG]|0)$ ]] || exit 1
+
+echo
+echo "Vulkan = graphics API used by games (Wine/Proton, DXVK, Steam)."
+echo "This installs the Vulkan loader (64-bit + 32-bit), GPU driver 32-bit, and vulkaninfo."
+read -rp "Install Vulkan? [Y/n]: " VULKAN_CHOICE
+INSTALL_VULKAN=1
+case "$VULKAN_CHOICE" in n | N | no | NO) INSTALL_VULKAN=0 ;; esac
+
+VG_NAME=voidvm
+read -rp "Encrypt the whole disk (LUKS1 + LVM, Void handbook FDE)? [y/N]: " FDE_CHOICE
+ENCRYPT=0
+case "$FDE_CHOICE" in y | Y | yes | YES) ENCRYPT=1 ;; esac
+if [ "$ENCRYPT" -eq 1 ]; then
+  read -rp "Root volume size [10G]: " LV_ROOT
+  LV_ROOT=${LV_ROOT:-10G}
+  [[ "$LV_ROOT" =~ ^[0-9]+[MGT]$ ]] || exit 1
+  echo "The rest of the disk becomes /home. You will be asked for the LUKS passphrase."
+fi
+
+read -rp "Type 'YES' to continue: " CONFIRM
+[ "$CONFIRM" = "YES" ] || exit 1
+
+
+# Disk prefix for partitions
+if [[ "$DISK" == *"nvme"* || "$DISK" == *"mmcblk"* ]]; then
+  PART_PREFIX="${DISK}p"
+else
+  PART_PREFIX="${DISK}"
+fi
+
+swapoff -a 2>/dev/null || true
+umount -R /mnt 2>/dev/null || true
+vgchange -an "$VG_NAME" 2>/dev/null || true
+cryptsetup close "$VG_NAME" 2>/dev/null || true
+for part in "${PART_PREFIX}"*; do
+  [ -b "$part" ] && umount -f "$part" 2>/dev/null || true
+done
+
+wipefs -af "$DISK"
+blockdev --rereadpt "$DISK" 2>/dev/null || true
+sleep 1
+
+if [ "$BOOT_MODE" = "uefi" ]; then
+  sfdisk --wipe always --wipe-partitions always "$DISK" <<SFDISK
+label: gpt
+size=${EFI_SIZE}MiB, type=U
+type=L
+SFDISK
+  EFI_PART="${PART_PREFIX}1"
+  ROOT_PART="${PART_PREFIX}2"
+elif [ "$ENCRYPT" -eq 1 ]; then
+  sfdisk --wipe always --wipe-partitions always "$DISK" <<SFDISK
+label: dos
+type=83, bootable
+SFDISK
+  ROOT_PART="${PART_PREFIX}1"
+else
+  sfdisk --wipe always --wipe-partitions always "$DISK" <<SFDISK
+label: gpt
+size=1MiB, type=21686148-6449-6E6F-744E-656564454649
+type=L
+SFDISK
+  ROOT_PART="${PART_PREFIX}2"
+fi
+
+for i in 1 2 3 4 5; do
+  blockdev --rereadpt "$DISK" 2>/dev/null && break
+  sleep 2
+done
+udevadm settle 2>/dev/null || true
+sleep 2
+
+wait_for_blockdev() {
+  dev="$1"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -b "$dev" ] && return 0
+    blockdev --rereadpt "$DISK" 2>/dev/null || true
+    partx -u "$DISK" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    sleep 1
+  done
+  return 1
+}
+
+lsblk "$DISK" 2>/dev/null || true
+wait_for_blockdev "$ROOT_PART" || exit 1
+
+mkfs_fs() {
+  mkfs.ext4 -F -L "$1" "$2"
+}
+
+HOME_LV=0
+if [ "$ENCRYPT" -eq 1 ]; then
+  xbps-install -y lvm2 cryptsetup 2>/dev/null || true
+  modprobe dm_mod 2>/dev/null || true
+  modprobe dm_crypt 2>/dev/null || true
+  CRYPT_PART="$ROOT_PART"
+  wipefs -af "$CRYPT_PART" 2>/dev/null || true
+  cryptsetup luksFormat --type luks1 "$CRYPT_PART"
+  cryptsetup luksOpen "$CRYPT_PART" "$VG_NAME"
+  vgcreate "$VG_NAME" "/dev/mapper/$VG_NAME"
+  lvcreate --name root -L "$LV_ROOT" "$VG_NAME"
+  [ "$SWAP_SIZE" != "0" ] && lvcreate --name swap -L "$SWAP_SIZE" "$VG_NAME"
+  if [ "$(vgs --noheadings -o vg_free_count "$VG_NAME" | tr -d ' ')" -gt 0 ]; then
+    lvcreate --name home -l 100%FREE "$VG_NAME"
+    HOME_LV=1
+  fi
+  mkfs_fs root "/dev/$VG_NAME/root"
+  [ "$HOME_LV" -eq 1 ] && mkfs_fs home "/dev/$VG_NAME/home"
+  if [ "$SWAP_SIZE" != "0" ]; then
+    mkswap "/dev/$VG_NAME/swap"
+    swapon "/dev/$VG_NAME/swap"
+  fi
+  ROOT_DEV="/dev/$VG_NAME/root"
+else
+  wipefs -af "$ROOT_PART" 2>/dev/null || true
+  mkfs_fs root "$ROOT_PART"
+  ROOT_DEV="$ROOT_PART"
+fi
+
+if [ "$BOOT_MODE" = "uefi" ]; then
+  wait_for_blockdev "$EFI_PART" || exit 1
+  wipefs -af "$EFI_PART" 2>/dev/null || true
+  mkfs.vfat -F 32 "$EFI_PART"
+fi
+
+mount "$ROOT_DEV" /mnt
+if [ "$HOME_LV" -eq 1 ]; then
+  mkdir -p /mnt/home
+  mount "/dev/$VG_NAME/home" /mnt/home
+fi
+if [ "$BOOT_MODE" = "uefi" ]; then
+  mkdir -p /mnt/boot/efi
+  mount "$EFI_PART" /mnt/boot/efi
+fi
+
+detect_hw
+
+# Configure xbps repos
+REPO_BASE="https://repo-default.voidlinux.org"
+case "$MIRROR_CHOICE" in
+  2 | f | F | fastest)
+    best=0
+    for m in repo-fastly repo-de repo-fi; do
+      url="https://$m.voidlinux.org"
+      rm -f /tmp/mirror-probe
+      t0=$(date +%s%N)
+      if xbps-fetch -o /tmp/mirror-probe "$url/current/multilib/x86_64-repodata" >/dev/null 2>&1; then
+        t=$(( $(date +%s%N) - t0 ))
+        if [ "$best" -eq 0 ] || [ "$t" -lt "$best" ]; then
+          best=$t
+          REPO_BASE="$url"
+        fi
+      fi
+    done
+    rm -f /tmp/mirror-probe
+    ;;
+esac
+
+mkdir -p /mnt/etc/xbps.d
+cat >/mnt/etc/xbps.d/00-repository-main.conf <<EOF
+repository=${REPO_BASE}/current
+repository=${REPO_BASE}/current/nonfree
+repository=${REPO_BASE}/current/multilib
+repository=${REPO_BASE}/current/multilib/nonfree
+EOF
+
+mkdir -p /mnt/var/db/xbps/keys
+cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/ 2>/dev/null || true
+
+build_pkgs
+
+xbps-install -Sy -r /mnt $CORE_PKGS $EXTRA_PKGS || exit 1
+
+# Swap file
+if [ "$ENCRYPT" -eq 0 ] && [ "$SWAP_SIZE" != "0" ]; then
+  fallocate -l "$SWAP_SIZE" /mnt/swapfile
+  chmod 600 /mnt/swapfile
+  mkswap /mnt/swapfile
+fi
+
+# fstab
+fstab_line() {
+  printf 'UUID=%s\t%s\t%s\t%s\t0 %s\n' "$(blkid -s UUID -o value "$1")" "$2" "$3" "$4" "$5"
+}
+{
+  fstab_line "$ROOT_DEV" / ext4 defaults,noatime 1
+  if [ "$HOME_LV" -eq 1 ]; then fstab_line "/dev/$VG_NAME/home" /home ext4 defaults,noatime 2; fi
+  if [ "$BOOT_MODE" = "uefi" ]; then fstab_line "$EFI_PART" /boot/efi vfat defaults,noatime 2; fi
+  if [ "$ENCRYPT" -eq 1 ] && [ "$SWAP_SIZE" != "0" ]; then fstab_line "/dev/$VG_NAME/swap" none swap defaults 0; fi
+  if [ "$ENCRYPT" -eq 0 ] && [ "$SWAP_SIZE" != "0" ]; then printf '/swapfile\tnone\tswap\tdefaults\t0 0\n'; fi
+  printf 'tmpfs\t/tmp\ttmpfs\trw,nosuid,nodev,size=10%%,mode=1777\t0 0\n'
+} >/mnt/etc/fstab
+
+# Copy dotfiles
+mkdir -p /mnt/root/dotfiles
+tar -C "$SCRIPT_DIR" --exclude=.git -cf - . | tar -C /mnt/root/dotfiles -xf -
+
+write_env /mnt/root/install.env
+chmod 600 /mnt/root/install.env
+
+write_chroot_script /mnt/root/chroot-setup.sh
+
+chmod +x /mnt/root/chroot-setup.sh
+
+# Prepare resolv.conf for chroot
+mkdir -p /mnt/etc
+if [ ! -s /etc/resolv.conf ]; then
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
+fi
+rm -f /mnt/etc/resolv.conf 2>/dev/null || true
+cp -L /etc/resolv.conf /mnt/etc/resolv.conf || exit 1
+[ -s /mnt/etc/resolv.conf ] || exit 1
+
+# Wi-Fi
+if [ -f /tmp/wpa.conf ]; then
+  WIFI_SSID=$(sed -n 's/^[[:space:]]*ssid="\(.*\)"[[:space:]]*$/\1/p' /tmp/wpa.conf | head -1)
+  WIFI_PSK=$(sed -n 's/^[[:space:]]*psk=\([0-9a-fA-F]\{64\}\)[[:space:]]*$/\1/p' /tmp/wpa.conf | head -1)
+  if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
+    IWD_NAME="$WIFI_SSID"
+    if [[ ! "$IWD_NAME" =~ ^[A-Za-z0-9\ _-]+$ ]]; then
+      IWD_NAME="=$(printf '%s' "$WIFI_SSID" | od -An -tx1 | tr -d ' \n')"
+    fi
+    mkdir -p /mnt/var/lib/iwd
+    chmod 700 /mnt/var/lib/iwd
+    printf '[Security]\nPreSharedKey=%s\n' "$WIFI_PSK" >"/mnt/var/lib/iwd/${IWD_NAME}.psk"
+    chmod 600 "/mnt/var/lib/iwd/${IWD_NAME}.psk"
+  fi
+fi
+
+# Chroot and run setup
+echo
+[ "$ENCRYPT" -eq 1 ] && echo ">> You will be asked for the LUKS passphrase once more (keyfile setup)."
+for d in sys dev proc; do
+  mount --rbind "/$d" "/mnt/$d"
+  mount --make-rslave "/mnt/$d"
+done
+chroot /mnt /bin/bash /root/chroot-setup.sh
+
+rm -rf /mnt/root/chroot-setup.sh /mnt/root/install.env /mnt/root/dotfiles
+
+echo
+echo "Reboot"
+echo "Login as: $USERNAME"
+sleep 3
+umount -R /mnt
+swapoff -a 2>/dev/null || true
+reboot

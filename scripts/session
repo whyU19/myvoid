@@ -1,0 +1,36 @@
+#!/bin/sh
+# Session script, started by dwl:  dwl -s ~/.local/bin/session
+# stdin is dwl's status stream (tags, layout, title); it is handed to `status`,
+# the bar. When the bar exits (dwl quit), everything started here is stopped.
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=wlroots
+export SDL_VIDEODRIVER=wayland
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+export _JAVA_AWT_WM_NONREPARENTING=1
+
+dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE 2>/dev/null
+
+# every background job gets /dev/null as stdin so it never eats dwl's stream
+"$HOME/.config/display/display" restore </dev/null >/dev/null 2>&1
+"$HOME/.config/setbg/setbg" restore </dev/null >/dev/null 2>&1 &
+
+"$HOME/.config/lock/lock" -a 300 600 </dev/null >/dev/null 2>&1 &
+LOCK_PID=$!
+
+"$HOME/.config/clipboard/clipboard" watch </dev/null >/dev/null 2>&1 &
+CB_PID=$!
+
+pipewire </dev/null >/dev/null 2>&1 &
+PW_PID=$!
+sleep 0.5
+pipewire-pulse </dev/null >/dev/null 2>&1 &
+PWPULSE_PID=$!
+wireplumber </dev/null >/dev/null 2>&1 &
+WP_PID=$!
+
+"$HOME/.config/status/status"
+
+kill $LOCK_PID $CB_PID $PW_PID $PWPULSE_PID $WP_PID 2>/dev/null
+pkill -U "$(id -u)" -x setbg 2>/dev/null
+exit 0

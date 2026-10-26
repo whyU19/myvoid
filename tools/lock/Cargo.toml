@@ -1,0 +1,10 @@
+[package]
+name = "lock"
+version = "1.8.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+smithay-client-toolkit = "0.19"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
