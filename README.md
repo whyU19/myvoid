@@ -2,12 +2,12 @@
 
 ### Boot Void live ISO (glibc)
 ```bash
-git clone https://github.com/whyU19/myvoid && cd myvoid && sudo bash setup
+git clone https://github.com/Dessmy/VoidInstall && cd VoidInstall && sudo bash setup
 ```
 
 `setup` asks for a mode first:
 1. **Full install**: wipes the whole disk and installs Void.
-2. **Post Install**: keeps your system and only installs the packages, dotfiles, Rust tools and dwl for an existing user (run it as root on the installed system).
+2. **Scripts only**: keeps your system and only installs the packages, dotfiles, Rust tools and dwl for an existing user (run it as root on the installed system).
 
 **dwl** (compositor) + **foot** (terminal)
 Log in on tty1 and dwl starts (`~/.bash_profile`).
@@ -51,10 +51,10 @@ Log in on tty1 and dwl starts (`~/.bash_profile`).
 | `view` | xdg-shell |
 | `play` | (ffmpeg does the decoding) | xdg-shell |
 | `display` | (menus, saved modes, `restore`) | wlr-output-management |
-| `fm` | (terminal file manager with eza-style colours; preview with bat/eza; `e` edit; `fm -f/-m/-d OUT` is a file picker for other programs) | terminal only |
+| `fm` | (terminal file manager: select, copy, move, paste, delete, rename, archive, extract, recursive find, colour previews of code/images/PDF/archives; press `?` for all keys; `fm -f/-m/-d OUT` is a file picker for other programs) | terminal only |
 | `lock` | (`lock` now; `lock -a 300 600` locks after 300 s and turns screens off after 600 s; PAM service `lock`) | ext-session-lock, ext-idle-notify, wlr-output-power-management |
 | `capture` | wlr-screencopy, wlr-layer-shell (needs ffmpeg for recording) |
-| `clipboard` | (`clipboard history` = history menu; `clipboard watch` records the history) | wlr-data-control |
+| `clipboard` | wl-copy, wl-paste + clipboard script (`clipboard history` = history menu, `clipboard watch` records the history, `clipboard paste` prints it; neovim uses it as its clipboard) | wlr-data-control |
 
 Sources are in `~/.config/tools`; rebuild with
 `cd ~/.config/tools && cargo build --release` and copy

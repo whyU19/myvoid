@@ -57,7 +57,8 @@ build_pkgs() {
 
   EXTRA_PKGS="git curl pipewire wireplumber libspa-bluetooth alsa-utils bluez mesa-dri pulseaudio-utils foot
   font-firacode dejavu-fonts-ttf neovim ffmpeg
-  eza bat fd ripgrep dust duf procs"
+  eza bat fd ripgrep dust duf procs
+  chafa poppler-utils zip unzip zstd"
 
   [ "$IS_LAPTOP" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS tlp"
 
