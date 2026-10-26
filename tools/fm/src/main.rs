@@ -251,7 +251,7 @@ mod config {
         (Key::PageUp, Action::PageUp),
         (Key::Char('.'), Action::ToggleHidden),
         (Key::Char('s'), Action::Sort),
-        (Key::Char('p'), Action::TogglePreview),
+        (Key::Char('P'), Action::TogglePreview),
         (Key::Char('/'), Action::Search),
         (Key::Char('n'), Action::NewFile),
         (Key::Char('N'), Action::NewDir),
@@ -263,6 +263,40 @@ mod config {
         (Key::Char(' '), Action::Mark),
         (Key::Char('o'), Action::Pick),
         (Key::Char('e'), Action::Edit),
+        (Key::Char('a'), Action::SelectAll),
+        (Key::Char('u'), Action::ClearMarks),
+        (Key::Char('y'), Action::Copy),
+        (Key::Char('x'), Action::Cut),
+        (Key::Char('p'), Action::Paste),
+        (Key::Char('z'), Action::Archive),
+        (Key::Char('X'), Action::Extract),
+        (Key::Char('f'), Action::Find),
+        (Key::Char('?'), Action::Help),
+    ];
+
+    pub const STYLE_INFO: &str = "30;42";
+
+    /// Shown by `?`.
+    pub const HELP: &[&str] = &[
+        " fm keys",
+        "",
+        " move        j/k up/down   h/l back/open   g/G top/bottom   ctrl-d/u half page",
+        " select      space select/unselect (moves down)   a select all   u unselect all",
+        " copy/move   y copy   x move (cut)   p paste in this folder",
+        "             if a name already exists you are asked: overwrite / skip / rename",
+        " delete      d delete the selected items (asks y/N)",
+        " rename      r rename   n new file   N new folder",
+        " archive     z   then: z zip   g tar.gz   x tar.xz   s tar.zst   b tar.bz2   t tar",
+        " extract     X   then: h here   f into a new folder named after the archive",
+        "             (zip, tar, tar.gz/xz/zst/bz2, gz, xz, zst, bz2, 7z, rar)",
+        " find        f search in ALL subfolders (empty = list everything); enter = go there",
+        " filter      / filter this folder   esc clear",
+        " view        e edit with $EDITOR   P preview on/off   . hidden   s sort   R refresh",
+        " preview     text and code in colour (bat), folders (eza), images and PDF (chafa,",
+        "             pdftoppm), archive contents",
+        " quit        q",
+        "",
+        " press any key to close",
     ];
 
     /// ANSI colour per file type, like eza: LS_COLORS wins when set, otherwise
@@ -371,6 +405,15 @@ mod keys {
         Mark,
         Pick,
         Edit,
+        SelectAll,
+        ClearMarks,
+        Copy,
+        Cut,
+        Paste,
+        Archive,
+        Extract,
+        Find,
+        Help,
     }
 
     pub struct Reader {
@@ -690,9 +733,12 @@ mod term {
 }
 
 mod app {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::SystemTime;
 
     use crate::config;
@@ -774,6 +820,7 @@ mod app {
         NewDir,
         Rename,
         ConfirmDelete,
+        Find,
     }
 
     pub struct Prompt {
@@ -782,6 +829,162 @@ mod app {
         pub input: String,
         previous: String,
         pub target: Option<PathBuf>,
+    }
+
+    /// A question with single-key answers; the options are always shown in the status bar.
+    pub struct Choice {
+        pub kind: ChoiceKind,
+        pub text: String,
+    }
+
+    pub enum ChoiceKind {
+        Conflict,
+        Archive(Vec<PathBuf>),
+        Extract(Vec<PathBuf>),
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Policy {
+        Overwrite,
+        Skip,
+        Rename,
+    }
+
+    struct PasteJob {
+        items: VecDeque<(PathBuf, PathBuf)>,
+        cut: bool,
+        policy: Option<Policy>,
+        once: Option<Policy>,
+        done: usize,
+        skipped: usize,
+    }
+
+    pub struct FindState {
+        pub origin: PathBuf,
+        pub pattern: String,
+    }
+
+    const FIND_LIMIT: usize = 100_000;
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum ArchiveKind {
+        Zip,
+        Tar,
+        Gz,
+        Xz,
+        Zst,
+        Bz2,
+        Other7z,
+    }
+
+    pub fn archive_kind(name: &str) -> Option<ArchiveKind> {
+        let l = name.to_lowercase();
+        let tar = [".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tzst", ".tar.bz2", ".tbz2", ".tbz"];
+        if tar.iter().any(|e| l.ends_with(e)) {
+            return Some(ArchiveKind::Tar);
+        }
+        match l.rsplit_once('.').map(|(_, e)| e) {
+            Some("zip") | Some("jar") | Some("apk") => Some(ArchiveKind::Zip),
+            Some("gz") => Some(ArchiveKind::Gz),
+            Some("xz") => Some(ArchiveKind::Xz),
+            Some("zst") => Some(ArchiveKind::Zst),
+            Some("bz2") => Some(ArchiveKind::Bz2),
+            Some("7z") | Some("rar") => Some(ArchiveKind::Other7z),
+            _ => None,
+        }
+    }
+
+    /// "photos.tar.gz" -> "photos", "notes.txt.gz" -> "notes.txt"
+    fn archive_stem(name: &str) -> String {
+        let l = name.to_lowercase();
+        for e in [".tar.gz", ".tar.xz", ".tar.zst", ".tar.bz2", ".tgz", ".txz", ".tzst", ".tbz2", ".tbz", ".tar"] {
+            if l.ends_with(e) {
+                return name[..name.len() - e.len()].to_string();
+            }
+        }
+        name.rsplit_once('.').map(|(b, _)| b.to_string()).filter(|b| !b.is_empty()).unwrap_or_else(|| name.to_string())
+    }
+
+    fn unique_path(path: &Path) -> PathBuf {
+        if fs::symlink_metadata(path).is_err() {
+            return path.to_path_buf();
+        }
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let (stem, ext) = match name.split_once('.') {
+            Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+            _ => (name.clone(), String::new()),
+        };
+        for n in 1.. {
+            let candidate = dir.join(format!("{stem}_{n}{ext}"));
+            if fs::symlink_metadata(&candidate).is_err() {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+
+    fn remove_path(path: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(path),
+            Ok(_) => fs::remove_file(path),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+        let meta = fs::symlink_metadata(src)?;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(src)?;
+            std::os::unix::fs::symlink(target, dst)
+        } else if meta.is_dir() {
+            fs::create_dir_all(dst)?;
+            for entry in fs::read_dir(src)? {
+                let entry = entry?;
+                copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+            }
+            Ok(())
+        } else {
+            fs::copy(src, dst).map(|_| ())
+        }
+    }
+
+    /// Copy or move one item. Moving across file systems falls back to copy + delete.
+    fn transfer(src: &Path, dst: &Path, cut: bool) -> io::Result<()> {
+        if src.is_dir() && dst.starts_with(src) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot put a folder inside itself"));
+        }
+        if cut {
+            if fs::rename(src, dst).is_ok() {
+                return Ok(());
+            }
+            copy_recursive(src, dst)?;
+            remove_path(src)
+        } else {
+            copy_recursive(src, dst)
+        }
+    }
+
+    fn build_entry(name: String, dir_entry: &fs::DirEntry, file_type: fs::FileType) -> Entry {
+        let path = dir_entry.path();
+        let is_symlink = file_type.is_symlink();
+        let is_dir = file_type.is_dir() || (is_symlink && path.is_dir());
+        let (size, modified, exec, mode) = match dir_entry.metadata() {
+            Ok(metadata) => {
+                let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+                (metadata.len(), metadata.modified().ok(), !metadata.is_dir() && mode & 0o111 != 0, mode & 0o7777)
+            }
+            Err(_) => (0, None, false, 0),
+        };
+        Entry { name, path, is_dir, is_symlink, size, modified, exec, mode }
+    }
+
+    fn tool_error(program: &str, e: &io::Error, package: &str) -> String {
+        if e.kind() == io::ErrorKind::NotFound {
+            format!("{program} is not installed (xbps-install {package})")
+        } else {
+            format!("{program}: {e}")
+        }
     }
 
     enum Select {
@@ -806,6 +1009,16 @@ mod app {
         pub marked: Vec<PathBuf>,
         /// (path, width, height, hidden, lines) of the last tool-rendered preview
         pub preview_cache: Option<(PathBuf, usize, usize, bool, Vec<String>)>,
+        /// sixel image for the preview pane (cache and what to draw now)
+        pub sixel_cache: Option<(PathBuf, usize, usize, String)>,
+        pub sixel_out: Option<String>,
+        pub register: Vec<PathBuf>,
+        pub register_cut: bool,
+        pub choice: Option<Choice>,
+        paste_job: Option<PasteJob>,
+        pub find: Option<FindState>,
+        pub help: bool,
+        pub info: bool,
     }
 
     impl App {
@@ -825,6 +1038,15 @@ mod app {
                 pick,
                 marked: Vec::new(),
                 preview_cache: None,
+                sixel_cache: None,
+                sixel_out: None,
+                register: Vec::new(),
+                register_cut: false,
+                choice: None,
+                paste_job: None,
+                find: None,
+                help: false,
+                info: false,
             };
 
             app.entries = app.load_entries()?;
@@ -834,6 +1056,16 @@ mod app {
 
         pub fn handle_key(&mut self, key: Key, page: usize) -> Outcome {
             self.message = None;
+            self.info = false;
+
+            if self.help {
+                self.help = false;
+                return Outcome::None;
+            }
+            if self.choice.is_some() {
+                self.choice_key(key);
+                return Outcome::None;
+            }
 
             if self.prompt.is_some() {
                 self.prompt_key(key);
@@ -893,11 +1125,24 @@ mod app {
                 Action::Mark => self.mark(),
                 Action::Pick => return self.pick_now(),
                 Action::ClearFilter => {
-                    if !self.filter.is_empty() {
+                    if self.find.is_some() {
+                        self.exit_find();
+                    } else if !self.filter.is_empty() {
                         self.filter.clear();
                         self.reload(Select::First);
+                    } else if !self.marked.is_empty() {
+                        self.marked.clear();
                     }
                 }
+                Action::SelectAll => self.select_all(),
+                Action::ClearMarks => self.marked.clear(),
+                Action::Copy => self.stash(false),
+                Action::Cut => self.stash(true),
+                Action::Paste => self.paste(),
+                Action::Archive => self.start_archive(),
+                Action::Extract => self.start_extract(),
+                Action::Find => self.start_prompt(PromptKind::Find),
+                Action::Help => self.help = true,
             }
 
             Outcome::None
@@ -936,6 +1181,12 @@ mod app {
                 return Outcome::None;
             };
 
+            if self.find.is_some() && (entry.is_dir || self.pick == PickMode::Off) {
+                let path = entry.path.clone();
+                self.goto(&path);
+                return Outcome::None;
+            }
+
             if entry.is_dir {
                 let path = entry.path.clone();
                 self.enter_dir(&path);
@@ -948,13 +1199,13 @@ mod app {
         }
 
         fn mark(&mut self) {
-            if self.pick != PickMode::Files {
+            if self.pick == PickMode::File || self.pick == PickMode::Dir {
                 return;
             }
             let Some(entry) = self.current() else {
                 return;
             };
-            if entry.is_dir {
+            if entry.is_dir && self.pick == PickMode::Files {
                 return;
             }
             let path = entry.path.clone();
@@ -988,6 +1239,7 @@ mod app {
 
         /// Jump to a path: a directory is entered, a file selected in its directory.
         pub fn goto(&mut self, target: &Path) {
+            self.find = None;
             if target.is_dir() {
                 self.enter_dir(target);
             } else if let Some(parent) = target.parent() {
@@ -999,6 +1251,7 @@ mod app {
         }
 
         fn enter_dir(&mut self, path: &Path) {
+            self.find = None;
             match path.canonicalize() {
                 Ok(cwd) if cwd.is_dir() => {
                     self.cwd = cwd;
@@ -1011,6 +1264,10 @@ mod app {
         }
 
         fn parent(&mut self) {
+            if self.find.is_some() {
+                self.exit_find();
+                return;
+            }
             let Some(parent) = self.cwd.parent() else {
                 self.message = Some("already at root".into());
                 return;
@@ -1035,6 +1292,9 @@ mod app {
         }
 
         fn load_entries(&self) -> io::Result<Vec<Entry>> {
+            if let Some(f) = &self.find {
+                return Ok(self.find_entries(f));
+            }
             let needle = self.filter.to_lowercase();
             let mut entries = Vec::new();
 
@@ -1058,18 +1318,7 @@ mod app {
                     continue;
                 };
 
-                let path = entry.path();
-                let is_symlink = file_type.is_symlink();
-                let is_dir = file_type.is_dir() || (is_symlink && path.is_dir());
-                let (size, modified, exec, mode) = match entry.metadata() {
-                    Ok(metadata) => {
-                        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
-                        (metadata.len(), metadata.modified().ok(), !metadata.is_dir() && mode & 0o111 != 0, mode & 0o7777)
-                    }
-                    Err(_) => (0, None, false, 0),
-                };
-
-                entries.push(Entry { name, path, is_dir, is_symlink, size, modified, exec, mode });
+                entries.push(build_entry(name, &entry, file_type));
             }
 
             entries.sort_by(|a, b| {
@@ -1122,6 +1371,7 @@ mod app {
                 PromptKind::Search => ("/", self.filter.clone(), None),
                 PromptKind::NewFile => ("new file: ", String::new(), None),
                 PromptKind::NewDir => ("new dir: ", String::new(), None),
+                PromptKind::Find => ("find (all subfolders): ", String::new(), None),
                 PromptKind::Rename => {
                     let Some(entry) = self.current() else {
                         return;
@@ -1129,10 +1379,14 @@ mod app {
                     ("rename: ", entry.name.clone(), None)
                 }
                 PromptKind::ConfirmDelete => {
-                    let Some(entry) = self.current() else {
-                        return;
-                    };
-                    ("delete: ", String::new(), Some(entry.path.clone()))
+                    if self.marked.is_empty() {
+                        let Some(entry) = self.current() else {
+                            return;
+                        };
+                        ("delete: ", String::new(), Some(entry.path.clone()))
+                    } else {
+                        ("delete: ", String::new(), None)
+                    }
                 }
             };
 
@@ -1202,6 +1456,7 @@ mod app {
                 PromptKind::NewFile => self.create(&prompt.input, false),
                 PromptKind::NewDir => self.create(&prompt.input, true),
                 PromptKind::Rename => self.rename(&prompt.input),
+                PromptKind::Find => self.run_find(prompt.input),
                 PromptKind::ConfirmDelete => {}
             }
         }
@@ -1260,24 +1515,429 @@ mod app {
         }
 
         fn delete(&mut self, target: Option<PathBuf>) {
-            let Some(path) = target else {
+            let paths: Vec<PathBuf> = match target {
+                Some(p) => vec![p],
+                None => std::mem::take(&mut self.marked),
+            };
+            let mut failed = None;
+            for path in &paths {
+                if let Err(e) = remove_path(path) {
+                    failed = Some(format!("delete {}: {e}", path.display()));
+                }
+            }
+            let index = self.selected;
+            self.reload(Select::Index(index));
+            match failed {
+                Some(m) => self.message = Some(m),
+                None => self.notice(format!("deleted {} item(s)", paths.len())),
+            }
+        }
+
+        fn notice(&mut self, text: String) {
+            self.message = Some(text);
+            self.info = true;
+        }
+
+        /// What an action works on: the selected items, or the item under the cursor.
+        fn targets(&self) -> Vec<PathBuf> {
+            if !self.marked.is_empty() {
+                self.marked.clone()
+            } else {
+                self.current().map(|e| vec![e.path.clone()]).unwrap_or_default()
+            }
+        }
+
+        fn select_all(&mut self) {
+            let files_only = self.pick == PickMode::Files;
+            for e in &self.entries {
+                if (files_only && e.is_dir) || self.marked.contains(&e.path) {
+                    continue;
+                }
+                self.marked.push(e.path.clone());
+            }
+            self.notice(format!("{} selected - y copy, x move, d delete, z archive, u unselect", self.marked.len()));
+        }
+
+        // ---- copy / move / paste ----
+
+        fn stash(&mut self, cut: bool) {
+            let t = self.targets();
+            if t.is_empty() {
+                return;
+            }
+            let n = t.len();
+            self.register = t;
+            self.register_cut = cut;
+            self.marked.clear();
+            self.notice(format!(
+                "{} {n} item(s) - open the target folder and press p to paste",
+                if cut { "cut" } else { "copied" }
+            ));
+        }
+
+        fn paste(&mut self) {
+            if self.register.is_empty() {
+                self.message = Some("nothing to paste - press y (copy) or x (move) first".into());
+                return;
+            }
+            if self.find.is_some() {
+                self.message = Some("leave find results first (h or esc) and open the target folder".into());
+                return;
+            }
+            let mut items = VecDeque::new();
+            for src in &self.register {
+                if let Some(name) = src.file_name() {
+                    items.push_back((src.clone(), self.cwd.join(name)));
+                }
+            }
+            self.paste_job = Some(PasteJob { items, cut: self.register_cut, policy: None, once: None, done: 0, skipped: 0 });
+            self.paste_step();
+        }
+
+        fn paste_step(&mut self) {
+            loop {
+                let Some(job) = self.paste_job.as_mut() else {
+                    return;
+                };
+                let Some((src, dst)) = job.items.front().cloned() else {
+                    let (cut, done, skipped) = (job.cut, job.done, job.skipped);
+                    self.paste_job = None;
+                    if cut {
+                        self.register.clear();
+                    }
+                    self.reload(Select::First);
+                    self.notice(format!("{} {done} item(s){}", if cut { "moved" } else { "pasted" }, if skipped > 0 { format!(", skipped {skipped}") } else { String::new() }));
+                    return;
+                };
+
+                let exists = fs::symlink_metadata(&dst).is_ok();
+                let mut target = dst.clone();
+                let mut overwrite = false;
+                if exists {
+                    if src == dst {
+                        // pasting where it already is: a copy gets a new name, a move is a no-op
+                        if job.cut {
+                            job.items.pop_front();
+                            continue;
+                        }
+                        target = unique_path(&dst);
+                    } else {
+                        let decision = job.once.take().or(job.policy);
+                        match decision {
+                            None => {
+                                let name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                self.choice = Some(Choice {
+                                    kind: ChoiceKind::Conflict,
+                                    text: format!(" '{name}' exists:  [o]verwrite  [s]kip  [r]ename  |  all: [O]verwrite  [S]kip  [R]ename  |  [esc] stop"),
+                                });
+                                return;
+                            }
+                            Some(Policy::Skip) => {
+                                job.items.pop_front();
+                                job.skipped += 1;
+                                continue;
+                            }
+                            Some(Policy::Overwrite) => overwrite = true,
+                            Some(Policy::Rename) => target = unique_path(&dst),
+                        }
+                    }
+                }
+
+                let cut = job.cut;
+                job.items.pop_front();
+                if overwrite {
+                    if let Err(e) = remove_path(&target) {
+                        self.paste_job = None;
+                        self.message = Some(format!("overwrite: {e}"));
+                        return;
+                    }
+                }
+                match transfer(&src, &target, cut) {
+                    Ok(()) => {
+                        if let Some(job) = self.paste_job.as_mut() {
+                            job.done += 1;
+                        }
+                    }
+                    Err(e) => {
+                        self.paste_job = None;
+                        self.message = Some(format!("{}: {e}", src.display()));
+                        self.reload(Select::First);
+                        return;
+                    }
+                }
+            }
+        }
+
+        fn choice_key(&mut self, key: Key) {
+            let Some(choice) = self.choice.take() else {
                 return;
             };
-
-            let is_dir = fs::symlink_metadata(&path).map(|meta| meta.is_dir()).unwrap_or(false);
-            let result = if is_dir {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-
-            match result {
-                Ok(()) => {
-                    let index = self.selected;
-                    self.reload(Select::Index(index));
+            match choice.kind {
+                ChoiceKind::Conflict => {
+                    let Some(job) = self.paste_job.as_mut() else {
+                        return;
+                    };
+                    match key {
+                        Key::Char('o') => job.once = Some(Policy::Overwrite),
+                        Key::Char('s') => job.once = Some(Policy::Skip),
+                        Key::Char('r') => job.once = Some(Policy::Rename),
+                        Key::Char('O') => job.policy = Some(Policy::Overwrite),
+                        Key::Char('S') => job.policy = Some(Policy::Skip),
+                        Key::Char('R') => job.policy = Some(Policy::Rename),
+                        Key::Esc | Key::Char('q') => {
+                            let done = job.done;
+                            self.paste_job = None;
+                            self.reload(Select::First);
+                            self.notice(format!("stopped after {done} item(s)"));
+                            return;
+                        }
+                        _ => {
+                            self.choice = Some(choice);
+                            return;
+                        }
+                    }
+                    self.paste_step();
                 }
-                Err(e) => self.message = Some(format!("delete: {e}")),
+                ChoiceKind::Archive(sources) => match key {
+                    Key::Char(c) if "zgxsbt".contains(c) => self.do_archive(sources, c),
+                    Key::Esc | Key::Char('q') => {}
+                    _ => self.choice = Some(Choice { kind: ChoiceKind::Archive(sources), text: choice.text }),
+                },
+                ChoiceKind::Extract(archives) => match key {
+                    Key::Char('h') => self.do_extract(archives, false),
+                    Key::Char('f') => self.do_extract(archives, true),
+                    Key::Esc | Key::Char('q') => {}
+                    _ => self.choice = Some(Choice { kind: ChoiceKind::Extract(archives), text: choice.text }),
+                },
             }
+        }
+
+        // ---- archive / extract ----
+
+        fn start_archive(&mut self) {
+            let t = self.targets();
+            if t.is_empty() {
+                return;
+            }
+            self.choice = Some(Choice {
+                kind: ChoiceKind::Archive(t),
+                text: " archive as:  [z] zip   [g] tar.gz   [x] tar.xz   [s] tar.zst   [b] tar.bz2   [t] tar   |  [esc] cancel".into(),
+            });
+        }
+
+        fn do_archive(&mut self, sources: Vec<PathBuf>, fmt: char) {
+            let Some(base) = sources.first().and_then(|p| p.parent()).map(Path::to_path_buf) else {
+                return;
+            };
+            if sources.iter().any(|p| p.parent() != Some(base.as_path())) {
+                self.message = Some("archive: select items from one folder only".into());
+                return;
+            }
+            let names: Vec<OsString> = sources.iter().filter_map(|p| p.file_name().map(|n| n.to_os_string())).collect();
+            let ext = match fmt {
+                'z' => "zip",
+                'g' => "tar.gz",
+                'x' => "tar.xz",
+                's' => "tar.zst",
+                'b' => "tar.bz2",
+                _ => "tar",
+            };
+            let stem = if names.len() == 1 { names[0].to_string_lossy().into_owned() } else { "archive".to_string() };
+            let out = unique_path(&base.join(format!("{stem}.{ext}")));
+
+            let mut cmd;
+            let (program, package);
+            if fmt == 'z' {
+                program = "zip";
+                package = "zip";
+                cmd = Command::new("zip");
+                cmd.args(["-r", "-q"]).arg(&out);
+            } else {
+                program = "tar";
+                package = "tar";
+                cmd = Command::new("tar");
+                match fmt {
+                    'g' => cmd.arg("-czf"),
+                    'x' => cmd.arg("-cJf"),
+                    'b' => cmd.arg("-cjf"),
+                    's' => cmd.args(["--zstd", "-cf"]),
+                    _ => cmd.arg("-cf"),
+                };
+                cmd.arg(&out);
+            }
+            cmd.arg("--").args(&names).current_dir(&base).stdin(Stdio::null());
+
+            match cmd.output() {
+                Ok(o) if o.status.success() => {
+                    self.marked.clear();
+                    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.reload(Select::Name(name.clone()));
+                    self.notice(format!("archived -> {name}"));
+                }
+                Ok(o) => {
+                    let _ = remove_path(&out);
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    self.message = Some(format!("{program}: {}", err.lines().next().unwrap_or("failed")));
+                }
+                Err(e) => self.message = Some(tool_error(program, &e, package)),
+            }
+        }
+
+        fn start_extract(&mut self) {
+            let archives: Vec<PathBuf> = self
+                .targets()
+                .into_iter()
+                .filter(|p| p.file_name().and_then(|n| archive_kind(&n.to_string_lossy())).is_some())
+                .collect();
+            if archives.is_empty() {
+                self.message = Some("not an archive (zip, tar, tar.gz/xz/zst/bz2, gz, xz, zst, bz2, 7z, rar)".into());
+                return;
+            }
+            self.choice = Some(Choice {
+                kind: ChoiceKind::Extract(archives),
+                text: " extract:  [h] here (this folder)   [f] into a new folder named after the archive   |  [esc] cancel".into(),
+            });
+        }
+
+        fn do_extract(&mut self, archives: Vec<PathBuf>, into_folder: bool) {
+            let mut count = 0;
+            for archive in &archives {
+                let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let Some(kind) = archive_kind(&name) else {
+                    continue;
+                };
+                let dest = if into_folder { unique_path(&self.cwd.join(archive_stem(&name))) } else { self.cwd.clone() };
+                if let Err(e) = fs::create_dir_all(&dest) {
+                    self.message = Some(format!("extract: {e}"));
+                    return;
+                }
+                let result = match kind {
+                    ArchiveKind::Zip => Command::new("unzip")
+                        .args(["-n", "-q"])
+                        .arg(archive)
+                        .arg("-d")
+                        .arg(&dest)
+                        .stdin(Stdio::null())
+                        .output()
+                        .map_err(|e| tool_error("unzip", &e, "unzip")),
+                    ArchiveKind::Tar => Command::new("tar")
+                        .arg("-xf")
+                        .arg(archive)
+                        .arg("-C")
+                        .arg(&dest)
+                        .stdin(Stdio::null())
+                        .output()
+                        .map_err(|e| tool_error("tar", &e, "tar")),
+                    ArchiveKind::Gz | ArchiveKind::Xz | ArchiveKind::Zst | ArchiveKind::Bz2 => {
+                        let (program, package) = match kind {
+                            ArchiveKind::Gz => ("gzip", "gzip"),
+                            ArchiveKind::Xz => ("xz", "xz"),
+                            ArchiveKind::Zst => ("zstd", "zstd"),
+                            _ => ("bzip2", "bzip2"),
+                        };
+                        let out_path = unique_path(&dest.join(archive_stem(&name)));
+                        match fs::File::create(&out_path) {
+                            Ok(f) => Command::new(program)
+                                .arg("-dc")
+                                .arg(archive)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::from(f))
+                                .output()
+                                .map_err(|e| tool_error(program, &e, package)),
+                            Err(e) => Err(format!("extract: {e}")),
+                        }
+                    }
+                    ArchiveKind::Other7z => {
+                        let mut found = None;
+                        for program in ["7z", "7zz", "7za", "7zr"] {
+                            match Command::new(program)
+                                .arg("x")
+                                .arg("-y")
+                                .arg(format!("-o{}", dest.display()))
+                                .arg(archive)
+                                .stdin(Stdio::null())
+                                .output()
+                            {
+                                Ok(o) => {
+                                    found = Some(o);
+                                    break;
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                                Err(e) => {
+                                    self.message = Some(format!("{program}: {e}"));
+                                    return;
+                                }
+                            }
+                        }
+                        found.ok_or_else(|| "7z is not installed (xbps-install 7zip)".to_string())
+                    }
+                };
+                match result {
+                    Ok(o) if o.status.success() => count += 1,
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        self.message = Some(format!("{name}: {}", err.lines().next().unwrap_or("extract failed")));
+                        self.reload(Select::First);
+                        return;
+                    }
+                    Err(m) => {
+                        self.message = Some(m);
+                        return;
+                    }
+                }
+            }
+            self.marked.clear();
+            self.reload(Select::First);
+            self.notice(format!("extracted {count} archive(s){}", if into_folder { " into new folder(s)" } else { "" }));
+        }
+
+        // ---- recursive find ----
+
+        fn run_find(&mut self, pattern: String) {
+            self.find = Some(FindState { origin: self.cwd.clone(), pattern });
+            self.reload(Select::First);
+            let n = self.entries.len();
+            let limit = if n >= FIND_LIMIT { format!(" (stopped at {FIND_LIMIT})") } else { String::new() };
+            self.notice(format!("{n} result(s){limit} - enter go to it, h/esc back"));
+        }
+
+        fn exit_find(&mut self) {
+            self.find = None;
+            self.reload(Select::First);
+        }
+
+        fn find_entries(&self, f: &FindState) -> Vec<Entry> {
+            let needle = f.pattern.to_lowercase();
+            let mut out: Vec<Entry> = Vec::new();
+            let mut stack = vec![f.origin.clone()];
+            while let Some(dir) = stack.pop() {
+                let Ok(rd) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !self.show_hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let Ok(ft) = e.file_type() else {
+                        continue;
+                    };
+                    let path = e.path();
+                    if ft.is_dir() {
+                        stack.push(path.clone());
+                    }
+                    let rel = path.strip_prefix(&f.origin).unwrap_or(&path).to_string_lossy().into_owned();
+                    if needle.is_empty() || rel.to_lowercase().contains(&needle) {
+                        out.push(build_entry(rel, &e, ft));
+                        if out.len() >= FIND_LIMIT {
+                            out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                            return out;
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            out
         }
     }
 
@@ -1312,13 +1972,16 @@ mod ui {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use crate::app::{App, PickMode, PromptKind};
+    use crate::app::{archive_kind, App, ArchiveKind, PickMode, PromptKind};
     use crate::config;
 
     pub fn draw(app: &mut App, size: (u16, u16)) -> io::Result<()> {
         let width = size.0.max(1) as usize;
         let height = size.1.max(2) as usize;
         let content_height = height - 2;
+        if app.help {
+            return draw_help(width, height);
+        }
         app.scroll(content_height);
 
         let show_preview =
@@ -1338,7 +2001,10 @@ mod ui {
         let mut out = String::with_capacity(width * height + 256);
         out.push_str("\x1b[H");
 
-        let header = format!(" {}", short_path(&app.cwd));
+        let header = match &app.find {
+            Some(f) => format!(" find: {}   ({} results in {})", f.pattern, app.entries.len(), short_path(&f.origin)),
+            None => format!(" {}", short_path(&app.cwd)),
+        };
         out.push_str(&paint(config::STYLE_HEADER, &fit(&header, width)));
         out.push_str("\x1b[0m\x1b[K\r\n");
 
@@ -1374,6 +2040,14 @@ mod ui {
         out.push_str(&status);
         out.push_str("\x1b[0m\x1b[K");
 
+        // sixel image on top of the (blank) preview pane
+        if show_preview {
+            if let Some(sixel) = &app.sixel_out {
+                out.push_str(&format!("\x1b[2;{}H", list_width + 2));
+                out.push_str(sixel);
+            }
+        }
+
         match cursor {
             Some(column) => out.push_str(&format!(
                 "\x1b[{};{}H\x1b[?25h",
@@ -1388,8 +2062,31 @@ mod ui {
         stdout.flush()
     }
 
+    fn draw_help(width: usize, height: usize) -> io::Result<()> {
+        let mut out = String::from("\x1b[H\x1b[?25l");
+        for row in 0..height {
+            let line = config::HELP.get(row).copied().unwrap_or("");
+            let style = if row == 0 { config::STYLE_HEADER } else { "" };
+            out.push_str(&paint(style, &fit(line, width)));
+            out.push_str("\x1b[0m\x1b[K");
+            if row + 1 < height {
+                out.push_str("\r\n");
+            }
+        }
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(out.as_bytes())?;
+        stdout.flush()
+    }
+
     fn status_line(app: &App, width: usize) -> (String, Option<usize>) {
+        if let Some(choice) = &app.choice {
+            return (paint(config::STYLE_PROMPT, &fit(&choice.text, width)), None);
+        }
         if let Some(prompt) = &app.prompt {
+            if prompt.kind == PromptKind::ConfirmDelete && prompt.target.is_none() {
+                let text = format!(" delete {} selected item(s)? [y/N]", app.marked.len());
+                return (paint(config::STYLE_PROMPT, &fit(&text, width)), None);
+            }
             if prompt.kind == PromptKind::ConfirmDelete {
                 let name = prompt
                     .target
@@ -1413,10 +2110,8 @@ mod ui {
         }
 
         if let Some(message) = &app.message {
-            return (
-                paint(config::STYLE_ERROR, &fit(&format!(" {message}"), width)),
-                None,
-            );
+            let style = if app.info { config::STYLE_INFO } else { config::STYLE_ERROR };
+            return (paint(style, &fit(&format!(" {message}"), width)), None);
         }
 
         let position = if app.entries.is_empty() {
@@ -1430,6 +2125,12 @@ mod ui {
             text.push_str(&format!("[{}] ", app.filter));
         }
 
+        if !app.marked.is_empty() {
+            text.push_str(&format!("[{} selected] ", app.marked.len()));
+        }
+        if !app.register.is_empty() {
+            text.push_str(&format!("[{} to {}] ", app.register.len(), if app.register_cut { "move" } else { "copy" }));
+        }
         if let Some(entry) = app.current() {
             text.push_str(&entry_details(entry));
         }
@@ -1517,6 +2218,18 @@ mod ui {
         let (path, is_dir) = (entry.path.clone(), entry.is_dir);
         let hidden = app.show_hidden;
 
+        app.sixel_out = None;
+        if !is_dir && width >= 8 && height >= 4 {
+            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tiff" | "jfif");
+            if image || ext == "pdf" {
+                if let Some(sixel) = sixel_for(app, &path, ext == "pdf", width, height) {
+                    app.sixel_out = Some(sixel);
+                    return vec![spaces(width); height];
+                }
+            }
+        }
+
         let mut lines = Vec::with_capacity(height);
         if height > 0 {
             let cached = match &app.preview_cache {
@@ -1556,6 +2269,36 @@ mod ui {
             }
             return vec![paint(config::STYLE_DIM, &fit(" directory", width))];
         }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if ext == "pdf" {
+            let mut cmd = Command::new("pdftotext");
+            cmd.args(["-l", "1", "-layout"]).arg(path).arg("-");
+            return tool_lines(cmd, width, height).unwrap_or_else(|| {
+                vec![paint(config::STYLE_DIM, &fit(" PDF preview needs poppler-utils (xbps-install poppler-utils) and chafa", width))]
+            });
+        }
+        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tiff" | "jfif") {
+            return vec![paint(config::STYLE_DIM, &fit(" image preview needs chafa (xbps-install chafa) and a sixel terminal", width))];
+        }
+        match archive_kind(&name) {
+            Some(ArchiveKind::Tar) => {
+                let mut cmd = Command::new("tar");
+                cmd.arg("-tf").arg(path);
+                if let Some(lines) = tool_lines(cmd, width, height) {
+                    return lines;
+                }
+            }
+            Some(ArchiveKind::Zip) => {
+                let mut cmd = Command::new("unzip");
+                cmd.arg("-l").arg(path);
+                if let Some(lines) = tool_lines(cmd, width, height) {
+                    return lines;
+                }
+            }
+            Some(_) => return vec![paint(config::STYLE_DIM, &fit(" compressed file - press X to extract", width))],
+            None => {}
+        }
         let text = fs::File::open(path)
             .ok()
             .map(|f| {
@@ -1566,7 +2309,7 @@ mod ui {
             .unwrap_or(false);
         if text {
             let mut cmd = Command::new("bat");
-            cmd.args(["--color=always", "--style=plain", "--paging=never", "--tabs=4"]);
+            cmd.args(["--color=always", "--style=plain", "--paging=never", "--tabs=4", "--theme=ansi"]);
             cmd.arg(format!("--line-range=:{}", height));
             cmd.arg(path);
             if let Some(lines) = tool_lines(cmd, width, height) {
@@ -1574,6 +2317,54 @@ mod ui {
             }
         }
         preview_file(path, width, height)
+    }
+
+    /// Sixel data (via chafa) for an image, or for page 1 of a PDF (via pdftoppm).
+    fn sixel_for(app: &mut App, path: &Path, pdf: bool, width: usize, height: usize) -> Option<String> {
+        if let Some((p, w, h, s)) = &app.sixel_cache {
+            if p == path && *w == width && *h == height {
+                return Some(s.clone());
+            }
+        }
+        let mut temp = None;
+        let source = if pdf {
+            let base = format!("/tmp/fm-pdf-{}", std::process::id());
+            let ok = Command::new("pdftoppm")
+                .args(["-png", "-r", "80", "-f", "1", "-l", "1", "-singlefile"])
+                .arg(path)
+                .arg(&base)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return None;
+            }
+            let png = std::path::PathBuf::from(format!("{base}.png"));
+            temp = Some(png.clone());
+            png
+        } else {
+            path.to_path_buf()
+        };
+        let out = Command::new("chafa")
+            .args(["-f", "sixels", "--animate=off", "-s", &format!("{width}x{height}")])
+            .arg(&source)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok();
+        if let Some(t) = temp {
+            let _ = fs::remove_file(t);
+        }
+        let out = out?;
+        if !out.status.success() || out.stdout.is_empty() {
+            return None;
+        }
+        let data = String::from_utf8_lossy(&out.stdout).trim_end_matches(['\n', '\r']).to_string();
+        app.sixel_cache = Some((path.to_path_buf(), width, height, data.clone()));
+        Some(data)
     }
 
     fn tool_lines(mut cmd: Command, width: usize, height: usize) -> Option<Vec<String>> {
