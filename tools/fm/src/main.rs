@@ -737,6 +737,7 @@ mod app {
         pub size: u64,
         pub modified: Option<SystemTime>,
         pub exec: bool,
+        pub mode: u32,
     }
 
     impl Entry {
@@ -1060,16 +1061,15 @@ mod app {
                 let path = entry.path();
                 let is_symlink = file_type.is_symlink();
                 let is_dir = file_type.is_dir() || (is_symlink && path.is_dir());
-                let (size, modified, exec) = match entry.metadata() {
-                    Ok(metadata) => (
-                        metadata.len(),
-                        metadata.modified().ok(),
-                        !metadata.is_dir() && std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o111 != 0,
-                    ),
-                    Err(_) => (0, None, false),
+                let (size, modified, exec, mode) = match entry.metadata() {
+                    Ok(metadata) => {
+                        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+                        (metadata.len(), metadata.modified().ok(), !metadata.is_dir() && mode & 0o111 != 0, mode & 0o7777)
+                    }
+                    Err(_) => (0, None, false, 0),
                 };
 
-                entries.push(Entry { name, path, is_dir, is_symlink, size, modified, exec });
+                entries.push(Entry { name, path, is_dir, is_symlink, size, modified, exec, mode });
             }
 
             entries.sort_by(|a, b| {
@@ -1350,7 +1350,7 @@ mod ui {
                     let text = fit(&format!("{marker}{}", entry.label()), list_width);
                     let base = config::entry_style(entry);
                     let style = if index == app.selected {
-                        if base.is_empty() { "7".to_string() } else { format!("7;{base}") }
+                        if base.is_empty() { "7".to_string() } else { format!("{base};7") }
                     } else if app.marked.contains(&entry.path) {
                         config::STYLE_MARK.to_string()
                     } else {
@@ -1430,38 +1430,104 @@ mod ui {
             text.push_str(&format!("[{}] ", app.filter));
         }
 
-        let hints = fit(if app.pick == PickMode::Off { config::HINTS } else { config::HINTS_PICK }, width.saturating_sub(display_width(&text)));
-        text.push_str(&hints);
+        if let Some(entry) = app.current() {
+            text.push_str(&entry_details(entry));
+        }
+        if app.pick != PickMode::Off {
+            text.push_str("   ");
+            text.push_str(config::HINTS_PICK);
+        }
 
         (paint(config::STYLE_STATUS, &fit(&text, width)), None)
+    }
+
+    /// "drwxr-xr-x  4.0 K  2026-10-25 14:03  directory (12 items)" for the status bar.
+    fn entry_details(entry: &crate::app::Entry) -> String {
+        let kind_char = if entry.is_symlink {
+            'l'
+        } else if entry.is_dir {
+            'd'
+        } else {
+            '-'
+        };
+        let mut perms = String::from(kind_char);
+        for shift in [6u32, 3, 0] {
+            let bits = (entry.mode >> shift) & 7;
+            perms.push(if bits & 4 != 0 { 'r' } else { '-' });
+            perms.push(if bits & 2 != 0 { 'w' } else { '-' });
+            perms.push(if bits & 1 != 0 { 'x' } else { '-' });
+        }
+
+        let size = if entry.is_dir {
+            match fs::read_dir(&entry.path) {
+                Ok(rd) => format!("{} items", rd.count()),
+                Err(_) => "-".to_string(),
+            }
+        } else {
+            human_size(entry.size)
+        };
+
+        let kind = if entry.is_symlink {
+            match fs::read_link(&entry.path) {
+                Ok(target) => format!("symlink -> {}", target.display()),
+                Err(_) => "symlink".to_string(),
+            }
+        } else if entry.is_dir {
+            "directory".to_string()
+        } else if entry.exec {
+            "executable".to_string()
+        } else {
+            match entry.name.rsplit_once('.') {
+                Some((base, ext)) if !base.is_empty() => format!("{} file", ext.to_lowercase()),
+                _ => "file".to_string(),
+            }
+        };
+
+        format!("{}  {}  {}  {}", perms, size, format_time(entry.modified), kind)
+    }
+
+    /// Local time as "2026-10-25 14:03".
+    fn format_time(time: Option<std::time::SystemTime>) -> String {
+        let Some(secs) = time
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as libc::time_t)
+        else {
+            return "-".to_string();
+        };
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            if libc::localtime_r(&secs, &mut tm).is_null() {
+                return "-".to_string();
+            }
+            let mut buf = [0u8; 32];
+            let n = libc::strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                b"%Y-%m-%d %H:%M\0".as_ptr() as *const libc::c_char,
+                &tm,
+            );
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        }
     }
 
     fn preview_lines(app: &mut App, width: usize, height: usize) -> Vec<String> {
         let Some(entry) = app.current() else {
             return vec![spaces(width); height];
         };
-        let (path, is_dir, name, size) = (entry.path.clone(), entry.is_dir, entry.name.clone(), entry.size);
+        let (path, is_dir) = (entry.path.clone(), entry.is_dir);
         let hidden = app.show_hidden;
 
         let mut lines = Vec::with_capacity(height);
-        let mut header = format!(" {}", name);
-        if !is_dir {
-            header.push_str("  ");
-            header.push_str(&human_size(size));
-        }
-        lines.push(paint(config::STYLE_PREVIEW_HEAD, &fit(&header, width)));
-
-        if height > 1 {
-            let body_height = height - 1;
+        if height > 0 {
             let cached = match &app.preview_cache {
-                Some((p, w, h, hd, l)) if *p == path && *w == width && *h == body_height && *hd == hidden => Some(l.clone()),
+                Some((p, w, h, hd, l)) if *p == path && *w == width && *h == height && *hd == hidden => Some(l.clone()),
                 _ => None,
             };
             let body = match cached {
                 Some(l) => l,
                 None => {
-                    let l = build_preview(&path, is_dir, hidden, width, body_height);
-                    app.preview_cache = Some((path.clone(), width, body_height, hidden, l.clone()));
+                    let l = build_preview(&path, is_dir, hidden, width, height);
+                    app.preview_cache = Some((path.clone(), width, height, hidden, l.clone()));
                     l
                 }
             };
