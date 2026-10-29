@@ -68,8 +68,8 @@ const INIT: usize = 0;
 const INPUT: usize = 1;
 const FAILED: usize = 2;
 
-/* 0xAARRGGBB: black after initialization, #005577 during input, #CC3333 wrong password */
-const COLORS: [u32; 3] = [0xff00_0000, 0xff00_5577, 0xffcc_3333];
+/* 0xAARRGGBB, Catppuccin Mocha: base after initialization, blue during input, red wrong password */
+const COLORS: [u32; 3] = [0xff1e_1e2e, 0xff89_b4fa, 0xfff3_8ba8];
 
 /* treat a cleared input like a wrong password (color) */
 const FAILONCLEAR: bool = true;
@@ -485,7 +485,12 @@ impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
     }
-    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+        }
+        // idle timers: created here because new_seat is not called for the seat that already exists
         if self.idle.is_empty() {
             if let Some(n) = &self.notifier {
                 // user data tells the two timers apart: 0 = lock, 1 = screens off
@@ -496,11 +501,6 @@ impl SeatHandler for App {
                     self.idle.push(n.get_idle_notification(self.off_secs.saturating_mul(1000), &seat, qh, 1u8));
                 }
             }
-        }
-    }
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
-        if cap == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
         }
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
