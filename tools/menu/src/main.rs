@@ -311,11 +311,8 @@ impl App {
             let fh = self.font.height();
             let listw = if self.haspv { g.lw } else { g.w };
 
-            cv.rect(g.x, g.y, g.w, g.h, theme::MANTLE);
-            cv.rect(g.x, g.y, g.w, g.hh, theme::CRUST);
-            if self.haspv {
-                cv.rect(g.x + g.lw, g.y + g.hh, g.w - g.lw, g.h - g.hh, theme::BASE);
-            }
+            // one solid colour, like a terminal: no panels, borders or bars
+            cv.rect(g.x, g.y, g.w, g.h, theme::BASE);
 
             // prompt + query
             let shown: String = if self.password {
@@ -331,7 +328,7 @@ impl App {
             let ty = g.y + (g.hh - fh) / 2;
             let fitted = self.font.fit(&line, g.w - 2 * PAD).to_string();
             let used = self.font.draw(&mut cv, g.x + PAD, ty, &fitted, theme::TEXT, g.w - 2 * PAD);
-            cv.rect(g.x + PAD + used + 1, ty, 2, fh, theme::MAUVE);
+            cv.rect(g.x + PAD + used, ty, self.font.width("m"), fh, 0xfff5_e0dc); // block cursor
 
             // rows
             for i in 0..g.rows {
@@ -343,7 +340,6 @@ impl App {
                 let y = g.y + g.hh + i as i32 * g.rowh;
                 if idx == self.sel {
                     cv.rect(g.x, y, listw, g.rowh, theme::SURFACE0);
-                    cv.rect(g.x, y, 3, g.rowh, theme::MAUVE);
                 }
                 let col = match &it.pv {
                     Some((true, _)) => theme::MAUVE,
