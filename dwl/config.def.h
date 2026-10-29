@@ -24,7 +24,6 @@ static int log_level = WLR_ERROR;
 static const Rule rules[] = {
 	/* app_id             title       tags mask     isfloating   monitor */
 	{ "Gimp",             NULL,       0,            1,           -1 }, /* Start on currently visible tags floating, not tiled */
-	{ "fm-pick",          NULL,       0,            1,           -1 }, /* fm file picker window: floating */
 	{ "firefox",          NULL,       1 << 8,       0,           -1 }, /* Start on ONLY tag "9" */
     /* default/example rule: can be changed but cannot be eliminated; at least one rule must exist */
 };
@@ -157,7 +156,6 @@ static const Key keys[] = {
 
 	/* scripts and tools (see ~/.local/bin) */
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_l,           spawn,            SHCMD("$HOME/.config/lock/lock") },
-	{ MODKEY,                    XKB_KEY_n,           spawn,            SHCMD("foot -e $HOME/.config/fm/fm") },
 	{ MODKEY,                    XKB_KEY_a,           spawn,            SHCMD("$HOME/.config/menu/menu -r") },
 	{ MODKEY,                    XKB_KEY_v,           spawn,            SHCMD("$HOME/.config/clipboard/clipboard history") },
 	{ MODKEY,                    XKB_KEY_w,           spawn,            SHCMD("$HOME/.local/bin/wifi") },
