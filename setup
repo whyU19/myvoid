@@ -36,9 +36,6 @@ detect_hw() {
 }
 
 build_pkgs() {
-  # dwl (Wayland compositor) is built from source. DWL_REF empty = default branch;
-  # set it to a tag (e.g. v0.8) to pin. dwl needs a specific wlroots release, so
-  # read it from dwl's config.mk and install the matching wlroots*-devel package.
   DWL_REPO="https://codeberg.org/dwl/dwl"
   DWL_REF=""
   if [ -n "$DWL_REF" ]; then DWL_RAW="$DWL_REPO/raw/tag/$DWL_REF/config.mk"; else DWL_RAW="$DWL_REPO/raw/branch/main/config.mk"; fi
@@ -56,9 +53,8 @@ build_pkgs() {
   fi
 
   EXTRA_PKGS="git curl pipewire wireplumber libspa-bluetooth alsa-utils bluez mesa-dri pulseaudio-utils foot
-  font-firacode dejavu-fonts-ttf neovim ffmpeg
-  eza bat fd ripgrep dust duf procs
-  chafa poppler-utils zip unzip zstd"
+  font-firacode dejavu-fonts-ttf fzf neovim ffmpeg
+  eza bat fd ripgrep dust duf procs"
 
   [ "$IS_LAPTOP" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS tlp"
 
@@ -82,7 +78,7 @@ build_pkgs() {
     EXTRA_PKGS="$EXTRA_PKGS linux-headers nvidia nvidia-libs-32bit nvidia-opencl"
   fi
 
-  # Vulkan loader + 32-bit driver (Wine/Proton games, incl. 32-bit ones, need both)
+  # Vulkan
   if [ "$INSTALL_VULKAN" -eq 1 ]; then
     EXTRA_PKGS="$EXTRA_PKGS vulkan-loader vulkan-loader-32bit Vulkan-Tools mesa-dri-32bit"
     [ "$HAS_AMD" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS mesa-vulkan-radeon-32bit"
@@ -198,7 +194,6 @@ SUDOERS
 chmod 0440 /etc/sudoers.d/10-wheel
 visudo -cf /etc/sudoers.d/10-wheel || exit 1
 else
-  # existing system: just give the user the groups the desktop needs
   for g in audio video input lp storage network kvm optical bluetooth _seatd; do
     getent group "$g" >/dev/null && usermod -aG "$g" "${USERNAME}" || true
   done
@@ -212,14 +207,9 @@ EnableNetworkConfiguration=true
 IWDCONF
 
 # XDG runtime dir
-# Void has no pam_systemd/elogind, so nothing creates /run/user/$UID and
-# PipeWire would refuse to start ("no runtime dir found"). Make it at
-# boot instead; $USERNAME's UID is written into the conf below.
 install -d -m 755 /etc/sv/user-runtime-dir
 cat >/etc/sv/user-runtime-dir/run <<'RUNTIME_EOF'
 #!/bin/sh
-# Create the XDG runtime dir that pam_systemd/elogind would normally
-# provide at login. It lives on tmpfs, so it has to be made per boot.
 . /etc/sv/user-runtime-dir/conf 2>/dev/null || true
 uid=${RUNTIME_UID:-1000}
 
@@ -273,7 +263,7 @@ cat >/etc/fonts/local.conf <<'FONTCONF'
 FONTCONF
 fc-cache -f
 
-# dwl (Wayland compositor): clone, use our config.def.h, build
+# dwl
 set -o pipefail
 DOT=/root/dotfiles
 rm -rf "$H/.config/dwl"
@@ -317,13 +307,11 @@ for item in "$DOT"/*; do
   esac
 done
 
-# Rust tools (menu setbg view play display status fm lock capture clipboard): sources live in
-# ~/.config/tools (cargo workspace), binaries in ~/.config/<name>/<name>.
 rm -rf "$H/.config/tools"
 cp -r "$DOT/tools" "$H/.config/tools"
 CARGO_HOME=/root/.cargo-build CARGO_TARGET_DIR=/root/tools-target \
   cargo build --release --manifest-path "$H/.config/tools/Cargo.toml" 2>&1 | tee /root/tools-build.log
-for name in menu setbg view play display status fm lock capture clipboard; do
+for name in menu setbg view play display status lock capture clipboard; do
   mkdir -p "$H/.config/$name"
   install -m 755 "/root/tools-target/release/$name" "$H/.config/$name/$name"
 done
@@ -337,10 +325,18 @@ ACTION=="add", SUBSYSTEM=="rfkill", RUN+="/usr/bin/rfkill unblock all"
 ACTION=="add", SUBSYSTEM=="backlight", ATTR{brightness}="1"
 UDEVRULE
 
+[ -s /etc/rc.local ] || echo '#!/bin/sh' >/etc/rc.local
+if ! grep -q 'lowest brightness' /etc/rc.local; then
+cat >>/etc/rc.local <<'RCLOCAL'
+( for i in $(seq 1 30); do ls /sys/class/backlight/* >/dev/null 2>&1 && break; sleep 1; done
+  for d in /sys/class/backlight/*; do echo 1 >"$d/brightness"; done ) &
+RCLOCAL
+fi
+chmod 755 /etc/rc.local
+
 # PAM service for the screen locker (lock)
 printf 'auth include login\n' >/etc/pam.d/lock
 
-# Wayland session environment (keyboard layout is read by dwl/xkbcommon from here)
 cat >/etc/profile.d/wayland-env.sh <<WLENV
 export XKB_DEFAULT_LAYOUT=${KBLAYOUT}
 export LIBSEAT_BACKEND=seatd

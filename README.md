@@ -16,7 +16,7 @@ Wayland only: **dwl** + **foot**. Log in on tty1 and dwl starts.
 
 | Key | Action |
 |-----|--------|
-| Shift+Enter / a / n | Terminal / launcher / file manager |
+| Shift+Enter / a | Terminal / launcher |
 | Shift+q / Shift+l | Quit dwl / lock screen |
 | j k / h l | Focus window / resize master |
 | Shift+c | Kill window |
@@ -38,13 +38,12 @@ Sources in `~/.config/tools`, binaries in `~/.config/<name>/<name>`.
 
 | Tool | What it does |
 |------|--------------|
-| `menu` | dmenu-style picker; `menu -r` is the launcher and calculator |
+| `menu` | launcher; `menu -r` is the launcher and calculator |
 | `status` | Top bar and notification daemon |
 | `setbg` | Background: `next`, `prev`, `restore`, or an image |
 | `view` | Image viewer |
 | `play` | Audio and video player (ffmpeg) |
 | `display` | Resolution and refresh rate menu; `restore` |
-| `fm` | Terminal file manager (`?` shows all keys); `fm -f/-m/-d OUT` is a file picker |
 | `lock` | Screen locker; `lock -a 300 600` locks after 300 s, screens off after 600 s |
 | `capture` | `shot [area]`, `rec [area]` |
 | `clipboard` | Copy, `paste`, `history`, `watch` |
