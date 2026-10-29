@@ -53,7 +53,7 @@ build_pkgs() {
   fi
 
   EXTRA_PKGS="git curl pipewire wireplumber libspa-bluetooth alsa-utils bluez mesa-dri pulseaudio-utils foot
-  font-firacode dejavu-fonts-ttf fzf neovim ffmpeg
+  font-firacode fzf neovim ffmpeg
   eza bat fd ripgrep dust duf procs"
 
   [ "$IS_LAPTOP" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS tlp"
