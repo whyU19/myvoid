@@ -224,7 +224,7 @@ printf 'RUNTIME_UID=%s\n' "$(id -u "$USERNAME")" >/etc/sv/user-runtime-dir/conf
 
 # Enable services
 mkdir -p /etc/runit/runsvdir/default
-for svc in dbus seatd iwd bluetoothd user-runtime-dir; do
+for svc in dbus seatd iwd bluetoothd tlp user-runtime-dir; do
   enable_svc "$svc"
 done
 
@@ -361,21 +361,33 @@ for d in "$H"/.config/*/; do
   ln -sf "$H/.config/$dname" "/root/.config/$dname"
 done
 
-# NVIDIA: Wayland compositors need DRM kernel modesetting
+# NVIDIA: Wayland compositors need DRM kernel modesetting.
+# fbdev=1 is only needed when NVIDIA is the only GPU: on a hybrid laptop it
+# fights with the iGPU over /dev/fb0 and can break the console.
 if [ "$HAS_NVIDIA" -eq 1 ]; then
-  echo 'options nvidia_drm modeset=1 fbdev=1' >/etc/modprobe.d/nvidia-drm.conf
+  echo 'options nvidia_drm modeset=1' >/etc/modprobe.d/nvidia-drm.conf
 fi
 
 # NVIDIA driver setup
 if [ "$HAS_NVIDIA" -eq 1 ] && { [ "$HAS_INTEL" -eq 1 ] || [ "$HAS_AMD" -eq 1 ]; }; then
 
+  # nvidia-dkms ships /usr/lib/modprobe.d/nvidia.conf holding the nouveau
+  # blacklist. modprobe reads only one file per name and /etc wins, so an
+  # /etc/modprobe.d/nvidia.conf without those lines shadows the package file
+  # and nouveau loads again: the GPU stays on nouveau, nvidia-smi fails and
+  # prime-run silently falls back to the iGPU. Keep the blacklist in here.
   cat >/etc/modprobe.d/nvidia.conf <<'NVMEOF'
-options nvidia NVreg_DynamicPowerManagement=0x02 NVreg_EnableGpuFirmware=0
+options nvidia NVreg_DynamicPowerManagement=0x02
+blacklist nouveau
+blacklist nova_core
+blacklist nova_drm
 NVMEOF
 
+  # Also keep nouveau out of the initramfs so it cannot grab the GPU first.
   mkdir -p /etc/dracut.conf.d
   cat >/etc/dracut.conf.d/10-nvidia.conf <<'DRACUTEOF'
 add_drivers+=" nvidia nvidia_modeset nvidia_uvm nvidia_drm "
+omit_drivers+=" nouveau nova_core nova_drm "
 DRACUTEOF
 fi
 
@@ -404,6 +416,10 @@ for n in 3 4 5 6; do
 done
 
 grub-mkconfig -o /boot/grub/grub.cfg
+else
+# Post-install mode: nothing would rebuild the initramfs, so the dracut config
+# written above never reaches it. Do it manually.
+command -v dracut >/dev/null 2>&1 && dracut --force
 fi
 
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
