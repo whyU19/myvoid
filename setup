@@ -53,7 +53,7 @@ build_pkgs() {
   fi
 
   EXTRA_PKGS="git curl pipewire wireplumber libspa-bluetooth alsa-utils bluez mesa-dri pulseaudio-utils foot
-  font-firacode fzf neovim ffmpeg
+  font-firacode fzf neovim ffmpeg libnotify
   eza bat fd ripgrep dust duf procs"
 
   [ "$IS_LAPTOP" -eq 1 ] && EXTRA_PKGS="$EXTRA_PKGS tlp"
@@ -269,8 +269,8 @@ DOT=/root/dotfiles
 rm -rf "$H/.config/dwl"
 git clone --depth 1 ${DWL_REF:+--branch "$DWL_REF"} "$DWL_REPO" "$H/.config/dwl"
 rm -rf "$H/.config/dwl/.git"
-if [ -f "$DOT/dwl/config.def.h" ]; then
-  cp "$DOT/dwl/config.def.h" "$H/.config/dwl/config.def.h"
+if [ -d "$DOT/dwl" ]; then
+  cp -r "$DOT/dwl/." "$H/.config/dwl/"
 fi
 rm -f "$H/.config/dwl/config.h"
 (cd "$H/.config/dwl" && make clean && make install && make clean) 2>&1 | tee /root/dwl-build.log
@@ -322,6 +322,7 @@ mkdir -p /etc/udev/rules.d
 cat >/etc/udev/rules.d/90-hardware.rules <<'UDEVRULE'
 ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
 ACTION=="add", SUBSYSTEM=="rfkill", RUN+="/usr/bin/rfkill unblock all"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*kbd_backlight*", RUN+="/bin/chgrp video /sys/class/leds/%k/brightness", RUN+="/bin/chmod g+w /sys/class/leds/%k/brightness"
 ACTION=="add", SUBSYSTEM=="backlight", ATTR{brightness}="1"
 UDEVRULE
 
