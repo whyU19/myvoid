@@ -22,9 +22,12 @@ static const float fullscreen_bg[]         = {0.0f, 0.0f, 0.0f, 1.0f}; /* You ca
 static int log_level = WLR_ERROR;
 
 static const Rule rules[] = {
-	/* app_id             title       tags mask     isfloating   monitor */
-	{ "Gimp",             NULL,       0,            1,           -1 }, /* Start on currently visible tags floating, not tiled */
-	{ "firefox",          NULL,       1 << 8,       0,           -1 }, /* Start on ONLY tag "9" */
+	/* app_id             title       tags mask     isfloating   monitor  nosuspend */
+	{ "Gimp",             NULL,       0,            1,           -1,      0 }, /* Start on currently visible tags floating, not tiled */
+	{ "firefox",          NULL,       1 << 8,       0,           -1,      0 }, /* Start on ONLY tag "9" */
+	{ "annerlord",        NULL,       0,            0,           -1,      1 },
+	{ NULL,               "annerlord", 0,           0,           -1,      1 },
+	{ NULL,               "ount & Blade", 0,        0,           -1,      1 },
     /* default/example rule: can be changed but cannot be eliminated; at least one rule must exist */
 };
 
