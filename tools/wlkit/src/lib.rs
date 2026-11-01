@@ -330,6 +330,24 @@ pub fn render(img: &RgbaImage, w: u32, h: u32, scale: f64, panx: i32, pany: i32,
     out
 }
 
+/// An image scaled to fit a size x size square (centered, transparent borders), RGBA.
+pub fn icon_rgba(path: &str, size: u32) -> Option<Vec<u8>> {
+    let img = open_rgba(path)?;
+    let s = fit_scale(img.width(), img.height(), size, size, false);
+    let nw = ((img.width() as f64 * s).round() as u32).clamp(1, size);
+    let nh = ((img.height() as f64 * s).round() as u32).clamp(1, size);
+    let scaled = imageops::resize(&img, nw, nh, FilterType::Triangle);
+    let mut out = vec![0u8; (size * size * 4) as usize];
+    let (ox, oy) = ((size - nw) / 2, (size - nh) / 2);
+    for y in 0..nh {
+        for x in 0..nw {
+            let i = (((oy + y) * size + ox + x) * 4) as usize;
+            out[i..i + 4].copy_from_slice(&scaled.get_pixel(x, y).0);
+        }
+    }
+    Some(out)
+}
+
 /// Load `path` scaled to fit (or cover) w x h on a `bg` background. BGRA, opaque.
 pub fn load_fit(path: &str, w: u32, h: u32, cover: bool, bg: u32) -> Option<Vec<u8>> {
     let img = open_rgba(path)?;
