@@ -22,7 +22,8 @@ use std::ptr;
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat,
     delegate_session_lock, delegate_shm,
     output::{OutputHandler, OutputState},
     reexports::{
@@ -33,7 +34,7 @@ use smithay_client_toolkit::{
         calloop_wayland_source::WaylandSource,
         client::{
             globals::registry_queue_init,
-            protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
+            protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
             backend::ObjectId,
             Connection, Dispatch, Proxy, QueueHandle,
         },
@@ -42,6 +43,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
     session_lock::{
@@ -218,6 +220,9 @@ struct App {
     lock_state: SessionLockState,
     qh: QueueHandle<App>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// keyboard backlight values to put back after unlocking
+    kbd_saved: Vec<(std::path::PathBuf, String)>,
 
     session: Option<SessionLock>,
     surfaces: Vec<Surf>,
@@ -397,10 +402,36 @@ impl App {
         }
         self.surfaces.clear();
         self.locked = false;
+        self.kbd_restore();
         self.failure = false;
         self.color = INIT;
         if !self.daemon {
             self.exit = Some(0);
+        }
+    }
+
+    /// Keyboard backlight off while locked (the kbd_backlight LEDs in /sys/class/leds).
+    fn kbd_off(&mut self) {
+        if !self.kbd_saved.is_empty() {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir("/sys/class/leds") else { return };
+        for e in rd.flatten() {
+            if !e.file_name().to_string_lossy().contains("kbd_backlight") {
+                continue;
+            }
+            let path = e.path().join("brightness");
+            let Ok(value) = std::fs::read_to_string(&path) else { continue };
+            let value = value.trim().to_string();
+            if !value.is_empty() && value != "0" && std::fs::write(&path, "0").is_ok() {
+                self.kbd_saved.push((path, value));
+            }
+        }
+    }
+
+    fn kbd_restore(&mut self) {
+        for (path, value) in self.kbd_saved.drain(..) {
+            let _ = std::fs::write(path, value);
         }
     }
 
@@ -416,6 +447,7 @@ impl App {
 impl SessionLockHandler for App {
     fn locked(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
         self.locked = true;
+        self.kbd_off();
         self.draw_all();
     }
 
@@ -424,6 +456,7 @@ impl SessionLockHandler for App {
         self.session = None;
         self.surfaces.clear();
         self.locked = false;
+        self.kbd_restore();
         if !self.daemon {
             eprintln!("lock: cannot lock (already locked, or not supported)");
             self.exit = Some(1);
@@ -490,6 +523,9 @@ impl SeatHandler for App {
         if cap == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
         }
+        if cap == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
         // idle timers: created here because new_seat is not called for the seat that already exists
         if self.idle.is_empty() {
             if let Some(n) = &self.notifier {
@@ -521,6 +557,17 @@ impl KeyboardHandler for App {
     }
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
     fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: u32) {}
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for e in events {
+            if let PointerEventKind::Enter { serial } = &e.kind {
+                // no cursor on the lock screen
+                pointer.set_cursor(*serial, None, 0, 0);
+            }
+        }
+    }
 }
 
 impl ShmHandler for App {
@@ -591,6 +638,7 @@ delegate_output!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_keyboard!(App);
+delegate_pointer!(App);
 delegate_session_lock!(App);
 delegate_registry!(App);
 
@@ -660,6 +708,8 @@ fn main() {
         lock_state: SessionLockState::new(&globals, &qh),
         qh: qh.clone(),
         keyboard: None,
+        pointer: None,
+        kbd_saved: Vec::new(),
         session: None,
         surfaces: Vec::new(),
         locked: false,
