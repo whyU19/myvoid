@@ -59,6 +59,8 @@ struct Item {
     lower: String,
     /// (is_image, path)
     pv: Option<(bool, String)>,
+    /// icon name or path from the .desktop file (launcher mode)
+    icon: Option<String>,
 }
 
 struct Geom {
@@ -106,6 +108,8 @@ struct App {
     ph: u32,
     preview_img: Option<Vec<u8>>,
     preview_text: Option<String>,
+    has_icons: bool,
+    icon_cache: HashMap<String, Option<Vec<u8>>>,
 
     /// Some(Some(text)) = chosen, Some(None) = cancelled
     result: Option<Option<String>>,
@@ -299,6 +303,21 @@ impl App {
                 self.top = self.sel;
             }
         }
+        let isz = (g.rowh - 8).max(8);
+        if self.has_icons {
+            for i in 0..g.rows {
+                let idx = self.top + i;
+                if idx >= self.vis.len() {
+                    break;
+                }
+                if let Some(name) = self.items[self.vis[idx]].icon.clone() {
+                    if !self.icon_cache.contains_key(&name) {
+                        let tile = find_icon(&name).and_then(|p| wlkit::icon_rgba(&p, isz as u32));
+                        self.icon_cache.insert(name, tile);
+                    }
+                }
+            }
+        }
         let (sw, sh) = (self.sw as i32, self.sh as i32);
         let (buffer, canvas) =
             match self.pool.create_buffer(sw, sh, sw * 4, wl_shm::Format::Argb8888) {
@@ -345,7 +364,24 @@ impl App {
                     Some((true, _)) => theme::MAUVE,
                     _ => theme::TEXT,
                 };
-                self.font.draw(&mut cv, g.x + PAD, y + (g.rowh - fh) / 2, &it.label, col, listw - 2 * PAD);
+                let mut tx = g.x + PAD;
+                if self.has_icons {
+                    if let Some(Some(tile)) = it.icon.as_ref().and_then(|n| self.icon_cache.get(n)) {
+                        let (ix, iy) = (g.x + PAD, y + (g.rowh - isz) / 2);
+                        for py in 0..isz {
+                            for px in 0..isz {
+                                let o = ((py * isz + px) * 4) as usize;
+                                let a = tile[o + 3];
+                                if a != 0 {
+                                    let c = 0xff00_0000 | (tile[o] as u32) << 16 | (tile[o + 1] as u32) << 8 | tile[o + 2] as u32;
+                                    cv.blend(ix + px, iy + py, c, a);
+                                }
+                            }
+                        }
+                    }
+                    tx += isz + PAD;
+                }
+                self.font.draw(&mut cv, tx, y + (g.rowh - fh) / 2, &it.label, col, listw - (tx - g.x) - PAD);
             }
             if self.vis.is_empty() && !self.items.is_empty() {
                 self.font.draw(
@@ -555,18 +591,53 @@ fn read_items(tabs: bool) -> (Vec<Item>, bool) {
                 }
             }
         }
-        items.push(Item { lower: label.to_lowercase(), label, line, pv });
+        items.push(Item { lower: label.to_lowercase(), label, line, pv, icon: None });
     }
     (items, haspv)
 }
 
 /* ---- launcher mode (-r) ---- */
 
+/// Find a PNG for an icon name in the icon themes (SVG-only icons are skipped).
+fn find_icon(name: &str) -> Option<String> {
+    if name.starts_with('/') {
+        return Some(name.to_string());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let roots = ["/usr/share/icons".to_string(), format!("{}/.local/share/icons", home)];
+    let sizes = ["48x48", "64x64", "128x128", "256x256", "32x32", "96x96", "72x72", "512x512", "24x24"];
+    for root in &roots {
+        let mut themes = vec!["hicolor".to_string()];
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let t = e.file_name().to_string_lossy().into_owned();
+                if t != "hicolor" {
+                    themes.push(t);
+                }
+            }
+        }
+        for theme in &themes {
+            for size in sizes {
+                let p = format!("{}/{}/{}/apps/{}.png", root, theme, size, name);
+                if std::path::Path::new(&p).is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    let p = format!("/usr/share/pixmaps/{}.png", name);
+    if std::path::Path::new(&p).is_file() {
+        return Some(p);
+    }
+    None
+}
+
 /// Applications from the .desktop files: items for the menu plus name -> command.
 fn load_apps() -> (Vec<Item>, HashMap<String, String>) {
     let home = std::env::var("HOME").unwrap_or_default();
     let dirs = ["/usr/share/applications".to_string(), format!("{}/.local/share/applications", home)];
     let mut apps: HashMap<String, String> = HashMap::new();
+    let mut icons: HashMap<String, String> = HashMap::new();
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut paths: Vec<_> = rd
@@ -578,6 +649,7 @@ fn load_apps() -> (Vec<Item>, HashMap<String, String>) {
         for p in paths {
             let Ok(text) = std::fs::read_to_string(&p) else { continue };
             let (mut name, mut exec, mut hidden, mut in_entry) = (None::<String>, None::<String>, false, false);
+            let mut icon = None::<String>;
             for line in text.lines() {
                 let line = line.trim();
                 if line.starts_with('[') {
@@ -596,6 +668,8 @@ fn load_apps() -> (Vec<Item>, HashMap<String, String>) {
                     name.get_or_insert_with(|| v.to_string());
                 } else if let Some(v) = line.strip_prefix("Exec=") {
                     exec.get_or_insert_with(|| v.to_string());
+                } else if let Some(v) = line.strip_prefix("Icon=") {
+                    icon.get_or_insert_with(|| v.to_string());
                 }
             }
             if let (false, Some(n), Some(e)) = (hidden, name, exec) {
@@ -614,8 +688,11 @@ fn load_apps() -> (Vec<Item>, HashMap<String, String>) {
                     cmd.push(c);
                 }
                 let cmd = cmd.trim().to_string();
-                if !n.is_empty() && !cmd.is_empty() {
-                    apps.entry(n).or_insert(cmd);
+                if !n.is_empty() && !cmd.is_empty() && !apps.contains_key(&n) {
+                    if let Some(i) = icon {
+                        icons.insert(n.clone(), i);
+                    }
+                    apps.insert(n, cmd);
                 }
             }
         }
@@ -624,7 +701,7 @@ fn load_apps() -> (Vec<Item>, HashMap<String, String>) {
     names.sort();
     let items = names
         .into_iter()
-        .map(|n| Item { lower: n.to_lowercase(), line: n.clone(), label: n, pv: None })
+        .map(|n| Item { lower: n.to_lowercase(), line: n.clone(), icon: icons.get(&n).cloned(), label: n, pv: None })
         .collect();
     (items, apps)
 }
@@ -869,6 +946,8 @@ fn main() {
         ph: 0,
         preview_img: None,
         preview_text: None,
+        has_icons: run_apps,
+        icon_cache: HashMap::new(),
         result: None,
     };
     app.refilter();
