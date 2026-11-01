@@ -17,6 +17,20 @@ pub struct Notif {
     pub icon: Option<IconSrc>,
 }
 
+/// Append a line to ~/.local/state/status.log (what the notification daemon saw).
+fn log(msg: &str) {
+    use std::io::Write;
+    let dir = format!("{}/.local/state", std::env::var("HOME").unwrap_or_default());
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{}/status.log", dir)) {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{} {}", t, msg);
+    }
+}
+
 struct Notifier {
     tx: Mutex<Sender<Notif>>,
     next: u32,
@@ -74,7 +88,8 @@ fn icon_from_hints(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Optio
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Notifier {
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["body".to_string()]
+        log("GetCapabilities");
+        vec!["body".to_string(), "body-markup".to_string(), "icon-static".to_string()]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -89,7 +104,8 @@ impl Notifier {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        let _ = (app_name, actions);
+        log(&format!("Notify app={} summary={:?} expire={}", app_name, summary, expire_timeout));
+        let _ = actions;
         let id = if replaces_id != 0 {
             replaces_id
         } else {
@@ -116,6 +132,7 @@ impl Notifier {
     fn close_notification(&self, _id: u32) {}
 
     fn get_server_information(&self) -> (String, String, String, String) {
+        log("GetServerInformation");
         ("status".to_string(), "void".to_string(), "0.1".to_string(), "1.2".to_string())
     }
 }
@@ -128,10 +145,16 @@ pub fn spawn(tx: Sender<Notif>) {
             .and_then(|b| b.serve_at("/org/freedesktop/Notifications", n))
             .and_then(|b| b.build());
         match built {
-            Ok(_conn) => loop {
-                std::thread::park();
-            },
-            Err(e) => eprintln!("status: notification daemon disabled: {}", e),
+            Ok(_conn) => {
+                log("notification daemon running (org.freedesktop.Notifications)");
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(e) => {
+                log(&format!("notification daemon NOT running: {}", e));
+                eprintln!("status: notification daemon disabled: {}", e);
+            }
         }
     });
 }
