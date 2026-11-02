@@ -89,7 +89,7 @@ fn icon_from_hints(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Optio
 impl Notifier {
     fn get_capabilities(&self) -> Vec<String> {
         log("GetCapabilities");
-        vec!["body".to_string(), "body-markup".to_string(), "icon-static".to_string()]
+        vec!["actions".to_string(), "body".to_string(), "body-markup".to_string(), "icon-static".to_string(), "persistence".to_string()]
     }
 
     #[allow(clippy::too_many_arguments)]
