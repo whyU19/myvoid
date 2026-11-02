@@ -415,17 +415,39 @@ impl App {
         if !self.kbd_saved.is_empty() {
             return;
         }
-        let Ok(rd) = std::fs::read_dir("/sys/class/leds") else { return };
+        let Ok(rd) = std::fs::read_dir("/sys/class/leds") else {
+            eprintln!("lock: cannot read /sys/class/leds");
+            return;
+        };
+        let mut found = 0;
         for e in rd.flatten() {
-            if !e.file_name().to_string_lossy().contains("kbd_backlight") {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let l = name.to_lowercase();
+            if !(l.contains("kbd") || l.contains("keyboard")) || l.contains("lock") || l.contains("mute") {
                 continue;
             }
+            found += 1;
             let path = e.path().join("brightness");
-            let Ok(value) = std::fs::read_to_string(&path) else { continue };
-            let value = value.trim().to_string();
-            if !value.is_empty() && value != "0" && std::fs::write(&path, "0").is_ok() {
-                self.kbd_saved.push((path, value));
+            let value = match std::fs::read_to_string(&path) {
+                Ok(v) => v.trim().to_string(),
+                Err(err) => {
+                    eprintln!("lock: keyboard backlight {}: cannot read brightness ({})", name, err);
+                    continue;
+                }
+            };
+            if value.is_empty() || value == "0" {
+                continue;
             }
+            match std::fs::write(&path, "0") {
+                Ok(()) => self.kbd_saved.push((path, value)),
+                Err(err) => eprintln!(
+                    "lock: keyboard backlight {}: cannot write brightness ({}) - check the udev rule and the video group",
+                    name, err
+                ),
+            }
+        }
+        if found == 0 {
+            eprintln!("lock: no keyboard backlight LED found in /sys/class/leds");
         }
     }
 
